@@ -34,7 +34,7 @@ function emptyQuota() {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98) {
+  constructor(accounts, switchThreshold = 0.98, scopedThreshold = 0.90) {
     this.accounts = accounts.map((acct, index) => ({
       index,
       name: acct.name,
@@ -62,6 +62,7 @@ export class AccountManager {
     }));
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold;
+    this.scopedThreshold = scopedThreshold;
   }
 
   /**
@@ -223,7 +224,7 @@ export class AccountManager {
     }
   }
 
-  _isNearQuota(account) {
+  _isNearQuota(account, modelClass = null) {
     const q = account.quota;
     this._clearExpiredQuotas(account);
 
@@ -240,6 +241,14 @@ export class AccountManager {
     if (q.requestsLimit != null && q.requestsRemaining != null) {
       const used = 1 - (q.requestsRemaining / q.requestsLimit);
       if (used >= this.switchThreshold) return true;
+    }
+
+    if (modelClass && account.quota.scopedLimits) {
+      const sl = account.quota.scopedLimits[modelClass];
+      if (sl && sl.isActive) {
+        if (sl.severity && sl.severity !== 'normal') return true;
+        if (sl.utilization != null && sl.utilization >= this.scopedThreshold) return true;
+      }
     }
 
     return false;

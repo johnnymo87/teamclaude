@@ -112,7 +112,8 @@ async function serverCommand() {
   }
 
   const threshold = config.switchThreshold || 0.98;
-  const accountManager = new AccountManager(accounts, threshold);
+  const scopedThreshold = config.scopedThreshold || 0.90;
+  const accountManager = new AccountManager(accounts, threshold, scopedThreshold);
 
   // Restore quota observed in a previous run so a restart doesn't lose rotation
   // state (passive — we never call the API to re-learn it). Stale windows are
