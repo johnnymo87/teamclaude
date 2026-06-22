@@ -86,9 +86,7 @@ test('mid-stream SSE usage-limit error in a 200 response reactively marks the sc
 });
 
 test('[R2] MAJOR-1: terminal 429 with a usage-limit body marks the opus scope and re-dispatches', async () => {
-  let hits = 0;
   const upstream = http.createServer((_req, res) => {
-    hits++;
     res.writeHead(429, { 'retry-after': '1', 'content-type': 'application/json' });
     res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'The usage limit has been reached' } }));
   });

@@ -6,7 +6,7 @@
 // captured limit response before relying on the proactive path being bypassed.
 const THROTTLE_RE = /temporarily limiting requests|not your usage limit/i;
 
-export function classifyLimitResponse(status, headers = {}, bodyJson = null) {
+export function classifyLimitResponse(status, _headers = {}, bodyJson = null) {
   const err = bodyJson?.error || bodyJson;
   const type = err?.type;
   const msg = typeof err?.message === 'string' ? err.message : '';
