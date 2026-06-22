@@ -28,3 +28,14 @@ test('an INACTIVE scope never gates', () => {
   a.quota.scopedLimits = { opus: { utilization: 1, resetAt: future(), severity: 'high', isActive: false } };
   assert.equal(am._isNearQuota(a, 'opus'), false);
 });
+
+test('_pickBestAvailable(class) skips the account constrained for that class', () => {
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98, 0.90);
+  const [a, b] = am.accounts;
+  a.quota.unified7dReset = Date.now() + 86_400_000;          // known weekly → available
+  b.quota.unified7dReset = Date.now() + 2 * 86_400_000;
+  a.quota.scopedLimits = { opus: { utilization: 0.99, resetAt: Date.now() + 3600_000, severity: 'normal', isActive: true } };
+  assert.equal(am._pickBestAvailable('opus').name, 'b');     // a is opus-near → pick b
+  assert.equal(am._pickBestAvailable('sonnet').name, 'a');   // sonnet unconstrained → a (sooner reset)
+  assert.equal(am._pickBestAvailable().name, 'a');           // class-free unchanged
+});

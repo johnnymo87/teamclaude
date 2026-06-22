@@ -94,7 +94,7 @@ export class AccountManager {
     return this._selectNext();
   }
 
-  _isAvailable(account) {
+  _isAvailable(account, modelClass = null) {
     if (!account) return false;
 
     // Manually disabled accounts are skipped entirely until re-enabled.
@@ -109,7 +109,7 @@ export class AccountManager {
     }
 
     if (account.status === 'exhausted' || account.status === 'error') return false;
-    if (this._isNearQuota(account)) return false;
+    if (this._isNearQuota(account, modelClass)) return false;
 
     return true;
   }
@@ -265,7 +265,7 @@ export class AccountManager {
    * With all priorities at the default 0, this reduces to the weekly-reset
    * heuristic. Returns the account or null if none are available.
    */
-  _pickBestAvailable() {
+  _pickBestAvailable(modelClass = null) {
     let best = null;
     let bestPriority = Infinity;
     let bestReset = Infinity;
@@ -275,7 +275,7 @@ export class AccountManager {
       // _isAvailable filters out accounts at/above the switch threshold, so the
       // soonest-expiring pick only ever lands on an account whose 5-hour quota
       // is still below 98%.
-      if (!this._isAvailable(account)) continue;
+      if (!this._isAvailable(account, modelClass)) continue;
 
       const priority = account.priority || 0;
       // Unknown weekly reset sorts first so we fill it in.
