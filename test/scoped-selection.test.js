@@ -39,3 +39,35 @@ test('_pickBestAvailable(class) skips the account constrained for that class', (
   assert.equal(am._pickBestAvailable('sonnet').name, 'a');   // sonnet unconstrained → a (sooner reset)
   assert.equal(am._pickBestAvailable().name, 'a');           // class-free unchanged
 });
+
+test('getActiveAccountFor diverts an opus request without moving currentIndex', () => {
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98, 0.90);
+  const [a, b] = am.accounts;
+  a.quota.unified7dReset = Date.now() + 86_400_000; a.probing = false;
+  b.quota.unified7dReset = Date.now() + 86_400_000; b.probing = false;
+  am.currentIndex = 0;
+  a.quota.scopedLimits = { opus: { utilization: 0.99, resetAt: Date.now() + 3600_000, severity: 'high', isActive: true } };
+
+  const picked = am.getActiveAccountFor('opus');
+  assert.equal(picked.name, 'b');          // diverted to a class-healthy account
+  assert.equal(am.currentIndex, 0);        // primary pointer unchanged (no thrash)
+
+  // A sonnet request (unconstrained) stays on the primary.
+  assert.equal(am.getActiveAccountFor('sonnet').name, 'a');
+  assert.equal(am.currentIndex, 0);
+});
+
+test('getActiveAccountFor(null) is exactly getActiveAccount()', () => {
+  const am = new AccountManager([oauth('a')], 0.98, 0.90);
+  am.accounts[0].quota.unified7dReset = Date.now() + 86_400_000;
+  assert.equal(am.getActiveAccountFor(null)?.name, 'a');
+});
+
+test('getActiveAccountFor returns null when every account is constrained for the class', () => {
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98, 0.90);
+  for (const a of am.accounts) {
+    a.quota.unified7dReset = Date.now() + 86_400_000; a.probing = false;
+    a.quota.scopedLimits = { opus: { utilization: 1, resetAt: Date.now() + 3600_000, severity: 'high', isActive: true } };
+  }
+  assert.equal(am.getActiveAccountFor('opus'), null);
+});

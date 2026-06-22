@@ -94,6 +94,32 @@ export class AccountManager {
     return this._selectNext();
   }
 
+  /**
+   * Per-request, model-aware account pick. Reuses the existing class-free
+   * getActiveAccount() to maintain the *primary* (currentIndex, requalify,
+   * preemption, switch logs) exactly as today, then statelessly DIVERTS the
+   * single request to a class-healthy account when the primary is constrained
+   * for this model class. Never mutates currentIndex/logs on the divert path,
+   * so a mixed Opus/Sonnet workload can't thrash the pointer. Returns null only
+   * when no account is available for the class (caller → 429).
+   */
+  getActiveAccountFor(modelClass) {
+    const primary = this.getActiveAccount();
+    if (!modelClass || !primary) return primary;
+    if (this._isAvailable(primary, modelClass)) {
+      const betterExists = this.accounts.some(a =>
+        this._isAvailable(a, modelClass) && (a.priority || 0) < (primary.priority || 0));
+      if (!betterExists) return primary;
+    }
+    // [R2] NIT-2: the divert path uses `_pickBestAvailable` (not `_selectNext`), so —
+    // unlike rotation — it does **not** set `probing` on a diverted account whose
+    // weekly window is still unknown. That's intended (the diverted account isn't
+    // `currentIndex`, and probing/requalify is a primary-rotation concern); its
+    // quota is still learned on its next live response/probe. No action needed;
+    // documented so it isn't mistaken for a bug.
+    return this._pickBestAvailable(modelClass);
+  }
+
   _isAvailable(account, modelClass = null) {
     if (!account) return false;
 
