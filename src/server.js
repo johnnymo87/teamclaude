@@ -5,12 +5,20 @@ import { join } from 'node:path';
 import { ensureCerts, createConnectHandler } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { BodyWriter } from './request-log.js';
+import { modelClass } from './account-manager.js';
 
 
 const HOP_BY_HOP_HEADERS = new Set([
   'host', 'connection', 'keep-alive', 'transfer-encoding',
   'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate',
 ]);
+
+// Best-effort extraction of the request's model class from a buffered JSON body.
+// Returns null on any failure (non-JSON, missing model, GET) → unified-only.
+function requestModelClass(method, body) {
+  if (method === 'GET' || method === 'HEAD' || !body || !body.length) return null;
+  try { return modelClass(JSON.parse(body.toString('utf8'))?.model); } catch { return null; }
+}
 
 export function createProxyServer(accountManager, config, hooks = {}) {
   const upstream = config.upstream || 'https://api.anthropic.com';
@@ -82,10 +90,11 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         bodyChunks.push(chunk);
       }
       const body = Buffer.concat(bodyChunks);
+      const reqModelClass = requestModelClass(req.method, body);
 
       const ctx = { account: null, status: null };
       try {
-        await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
+        await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, reqModelClass);
       } catch (err) {
         ctx.status = ctx.status || 502;
         console.error('[TeamClaude] Unhandled error:', err);
@@ -200,11 +209,11 @@ function formatHeaders(headers) {
   return Object.entries(headers).map(([k, v]) => `  ${k}: ${v}`).join('\n');
 }
 
-async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir) {
+async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, modelClass = null) {
   const maxRetries = accountManager.accounts.length;
 
   // Select account
-  const account = accountManager.getActiveAccount();
+  const account = accountManager.getActiveAccountFor(modelClass);
   if (!account) {
     ctx.status = 429;
     ctx.account = '(none available)';
@@ -231,7 +240,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   // Refresh OAuth token if needed
   await accountManager.ensureTokenFresh(account.index);
   if (account.status === 'error' && retryCount < maxRetries) {
-    return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+    return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, modelClass);
   }
 
   // Build upstream request headers
@@ -315,14 +324,14 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       if (retryCount >= maxRetries) {
         console.log(`[TeamClaude] Persistent 429 on "${account.name}" — throttling ${retryAfter}s and re-dispatching`);
         accountManager.markRateLimited(account.index, retryAfter);
-        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, modelClass);
       }
 
       console.log(`[TeamClaude] 429 on "${account.name}" — waiting ${retryAfter}s before retry`);
       await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
       // Client may have disconnected during the wait
       if (res.destroyed) return;
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, modelClass);
     }
 
     // Log the request head (once) followed by the response headers, streaming
@@ -387,7 +396,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
     if (retryCount < maxRetries && !res.headersSent) {
       account.status = 'error';
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, modelClass);
     }
     ctx.status = 502;
 
