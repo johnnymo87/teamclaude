@@ -55,3 +55,12 @@ test('getStatus exposes the disabled flag', () => {
   assert.equal(s.accounts[0].disabled, true);
   assert.equal(s.accounts[1].disabled, false);
 });
+
+test('a manually-disabled account is NOT reactivated by the soonest-reset fallback even if its reset has passed', () => {
+  const am = new AccountManager([oauth('a', { disabled: true })], 0.98);
+  // A reset timestamp in the PAST would otherwise trip the
+  // "all unavailable -> reactivate soonest reset" fallback.
+  am.accounts[0].quota.unified7dReset = Date.now() - 60_000;
+  assert.equal(am._selectNext(), null);
+  assert.equal(am.accounts[0].disabled, true);
+});

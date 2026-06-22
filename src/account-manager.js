@@ -391,6 +391,7 @@ export class AccountManager {
     let soonestAccount = null;
     let soonestTime = Infinity;
     for (const account of this.accounts) {
+      if (account.disabled) continue;
       const resetTime = this._soonestResetMs(account);
       if (resetTime != null && resetTime < soonestTime) {
         soonestTime = resetTime;
