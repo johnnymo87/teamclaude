@@ -84,3 +84,24 @@ test('mid-stream SSE usage-limit error in a 200 response reactively marks the sc
     upstream.close();
   }
 });
+
+test('[R2] MAJOR-1: terminal 429 with a usage-limit body marks the opus scope and re-dispatches', async () => {
+  let hits = 0;
+  const upstream = http.createServer((_req, res) => {
+    hits++;
+    res.writeHead(429, { 'retry-after': '1', 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'The usage limit has been reached' } }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([{ name: 'a', type: 'oauth', accessToken: 'tok-a', expiresAt: Date.now() + 3600_000 }], 0.98, 0.90);
+  am.accounts[0].quota.unified7dReset = Date.now() + 86_400_000; am.accounts[0].probing = false;
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-opus-4-8', messages: [] }) });
+    await res.text();
+    assert.equal(am.accounts[0].quota.scopedLimits.opus.utilization, 1);   // scope marked on the terminal 429
+  } finally { proxy.close(); upstream.close(); }
+});

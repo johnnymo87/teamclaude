@@ -21,6 +21,15 @@ function requestModelClass(method, body) {
   try { return modelClass(JSON.parse(body.toString('utf8'))?.model); } catch { return null; }
 }
 
+// [R2] MINOR-3: approximate scoped reset from the unified weekly header (design §6 m2).
+// limits[].resets_at is NOT available on a 429's headers, so this is the documented
+// fallback; null when absent → markScopeExhausted falls back to unified7dReset.
+export function scopedResetFromHeaders(headers = {}) {
+  const r = headers['anthropic-ratelimit-unified-7d-reset'];
+  const n = parseInt(r, 10);
+  return Number.isFinite(n) ? n * 1000 : null;
+}
+
 export function createProxyServer(accountManager, config, hooks = {}) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const proxyApiKey = config.proxy?.apiKey;
@@ -313,19 +322,27 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       let retryAfter = parseInt(upstreamRes.headers.get('retry-after'), 10);
       if (Number.isNaN(retryAfter)) retryAfter = 60;
       retryAfter = Math.min(Math.max(retryAfter, 1), 300);
-      // Discard the 429 response body
-      await upstreamRes.body?.cancel();
 
-      // Bound the retries: a persistently-throttled upstream must not loop
-      // forever (that would tie up the client connection indefinitely).
-      // Once retries are exhausted, throttle this account and re-dispatch —
-      // getActiveAccount then picks another account, or returns 429 to the
-      // client if every account is throttled.
+      // Terminal: buffer the body ONCE to distinguish a per-account usage limit
+      // (→ mark scope, re-dispatch) from the IP-keyed throttle (→ back off).
       if (retryCount >= maxRetries) {
+        let bodyJson = null;
+        try { bodyJson = JSON.parse(await upstreamRes.text()); } catch { bodyJson = null; }
+        const headers = Object.fromEntries(upstreamRes.headers.entries());
+        const c = classifyLimitResponse(429, headers, bodyJson);
+        if (c.kind === 'usage_limit' && modelClass) {
+          const resetMs = scopedResetFromHeaders(headers);   // approximate; limits[].resets_at not in headers
+          accountManager.markScopeExhausted(account.index, c.scope || modelClass, resetMs);
+          console.log(`[TeamClaude] Usage-limit on "${account.name}" (${c.scope || modelClass}) — re-dispatching`);
+          return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, modelClass);
+        }
+        // Not a usage limit (or no class) → existing throttle/back-off behavior.
         console.log(`[TeamClaude] Persistent 429 on "${account.name}" — throttling ${retryAfter}s and re-dispatching`);
         accountManager.markRateLimited(account.index, retryAfter);
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, modelClass);
       }
+      // Non-terminal: discard the body (we will retry the same account), wait, retry.
+      await upstreamRes.body?.cancel();
 
       console.log(`[TeamClaude] 429 on "${account.name}" — waiting ${retryAfter}s before retry`);
       await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));

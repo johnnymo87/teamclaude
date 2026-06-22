@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { classifyLimitResponse } from '../src/limit-classify.js';
+import { scopedResetFromHeaders } from '../src/server.js';  // export it for the test
 
 test('IP-throttle 429 is NOT a usage limit (back off, never mark scope)', () => {
   const r = classifyLimitResponse(429,
@@ -25,4 +26,9 @@ test('[R2] the design PRIMARY shape: message-based usage limit inside a 200, sha
 test('unrecognized → unknown (caller backs off, never marks a scope)', () => {
   assert.equal(classifyLimitResponse(200, {}, { type: 'message_start' }).kind, 'unknown');
   assert.equal(classifyLimitResponse(500, {}, null).kind, 'unknown');
+});
+
+test('[R2] scopedResetFromHeaders reads unified-7d-reset (×1000) or null', () => {
+  assert.equal(scopedResetFromHeaders({ 'anthropic-ratelimit-unified-7d-reset': '1700000000' }), 1700000000000);
+  assert.equal(scopedResetFromHeaders({}), null);
 });
