@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { modelClass } from '../src/account-manager.js';
+import { modelClass } from '../src/model-class.js';
 
 test('modelClass maps opus/sonnet wire + provider-prefixed ids', () => {
   assert.equal(modelClass('claude-opus-4-8'), 'opus');

@@ -4,7 +4,7 @@ import { randomBytes, createHash } from 'node:crypto';
 import { exec } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import http from 'node:http';
-import { modelClass } from './account-manager.js';
+import { modelClass } from './model-class.js';
 
 /**
  * Import OAuth credentials from a Claude Code credentials file.
