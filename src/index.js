@@ -500,6 +500,13 @@ async function statusCommand() {
         const wk = q.unified7d != null ? (q.unified7d * 100).toFixed(1) + '%' : '-';
         let line = `    Session:  ${ses} used    Weekly: ${wk} used`;
         if (q.unified7dSonnet != null) line += `    Sonnet7d: ${(q.unified7dSonnet * 100).toFixed(1)}% used`;
+        const sl = q.scopedLimits || {};
+        for (const cls of Object.keys(sl)) {
+          const s = sl[cls];
+          if (s && s.utilization != null) {
+            line += `    ${cls[0].toUpperCase()}${cls.slice(1)}(scoped): ${(s.utilization * 100).toFixed(1)}%${s.isActive ? '*' : ''}`;
+          }
+        }
         console.log(line);
       } else {
         const tok = q.tokensLimit ? ((1 - q.tokensRemaining / q.tokensLimit) * 100).toFixed(1) + '%' : '-';
