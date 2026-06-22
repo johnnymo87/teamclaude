@@ -552,6 +552,10 @@ export class TUI {
       if (q.unified7dSonnet != null) {
         line += `  S7  ${bar(q.unified7dSonnet, bw, q.unified7dSonnetReset)}`;
       }
+      const sl = q.scopedLimits || {};
+      if (sl.opus && sl.opus.utilization != null) {
+        line += `  O7  ${bar(sl.opus.utilization, bw, sl.opus.resetAt)}`;
+      }
     }
     return line;
   }
