@@ -361,6 +361,18 @@ export class AccountManager {
     return soonest;
   }
 
+  /** Seconds until the soonest FUTURE account reset (min 1), or 60 if nothing known.
+   *  [R2.1] MINOR-C: onlyFuture so an unpaired stale past reset can't floor this to 1s. */
+  computeRetryAfterSeconds() {
+    let soonest = Infinity;
+    for (const a of this.accounts) {
+      const r = this._soonestResetMs(a, { onlyFuture: true });
+      if (r != null && r < soonest) soonest = r;
+    }
+    if (soonest === Infinity) return 60;
+    return Math.max(1, Math.ceil((soonest - Date.now()) / 1000));
+  }
+
   _selectNext() {
     const best = this._pickBestAvailable();
     if (best) {

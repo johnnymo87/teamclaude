@@ -25,3 +25,22 @@ test('[R2] a throttled account with a stale quota reset is NOT reactivated early
   assert.equal(a.status, 'throttled');
 });
 
+test('computeRetryAfterSeconds = soonest future reset across accounts (≥1s), default 60', () => {
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98, 0.90);
+  assert.equal(am.computeRetryAfterSeconds(), 60);                 // nothing known
+  am.accounts[0].quota.unified7dReset = Date.now() + 30_000;
+  am.accounts[1].quota.unified7dReset = Date.now() + 120_000;
+  const s = am.computeRetryAfterSeconds();
+  assert.ok(s >= 25 && s <= 31, `got ${s}`);                      // ~30s, the soonest
+});
+
+test('[R2.1] MINOR-C: a stale past reset does NOT floor retry-after to 1s', () => {
+  const am = new AccountManager([oauth('a')], 0.98, 0.90);
+  const a = am.accounts[0];
+  a.rateLimitedUntil = Date.now() + 30_000;     // real throttle window ~30s
+  a.quota.unified7dReset = Date.now() - 5000;   // unpaired stale past field
+  const s = am.computeRetryAfterSeconds();
+  assert.ok(s >= 25 && s <= 31, `expected ~30s, got ${s}`);       // not 1s
+});
+
+

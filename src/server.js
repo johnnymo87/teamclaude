@@ -217,8 +217,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   if (!account) {
     ctx.status = 429;
     ctx.account = '(none available)';
-    const status = accountManager.getStatus();
-    const retryAfter = computeRetryAfter(status.accounts);
+    const retryAfter = accountManager.computeRetryAfterSeconds();
     res.writeHead(429, {
       'Content-Type': 'application/json',
       'retry-after': String(retryAfter),
@@ -490,16 +489,4 @@ function extractUsageFromBody(buffer, accountIndex, accountManager) {
   } catch {
     // not JSON or no usage
   }
-}
-
-function computeRetryAfter(accounts) {
-  let soonest = Infinity;
-  for (const acct of accounts) {
-    const reset = acct.rateLimitedUntil || acct.quota.resetsAt;
-    if (reset) {
-      const ms = new Date(reset).getTime() - Date.now();
-      if (ms < soonest) soonest = ms;
-    }
-  }
-  return soonest === Infinity ? 60 : Math.max(1, Math.ceil(soonest / 1000));
 }
