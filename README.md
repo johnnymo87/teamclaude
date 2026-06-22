@@ -207,6 +207,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
   },
   "upstream": "https://api.anthropic.com",
   "switchThreshold": 0.98,
+  "scopedThreshold": 0.90,
   "accounts": [
     {
       "name": "user@example.com (Acme)",
@@ -229,6 +230,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `proxy.apiKey` | API key clients use to authenticate with the proxy |
 | `upstream` | Upstream API base URL |
 | `switchThreshold` | Quota utilization (0–1) at which to switch accounts |
+| `scopedThreshold` | Per-model scoped quota utilization (0–1) at which to divert that model class to another account (default 0.90) |
 | `quotaProbeSeconds` | Background quota-probe interval in seconds (`0` = off, the default) |
 | `accounts[].accountUuid` | Anthropic account (person) id; set automatically from the OAuth profile |
 | `accounts[].orgUuid` / `orgName` | Organization the account is scoped to — lets one email hold multiple org accounts |
