@@ -4,6 +4,7 @@ import { randomBytes, createHash } from 'node:crypto';
 import { exec } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import http from 'node:http';
+import { modelClass } from './account-manager.js';
 
 /**
  * Import OAuth credentials from a Claude Code credentials file.
@@ -172,6 +173,40 @@ export function normalizeUsageBucket(bucket) {
 }
 
 /**
+ * Parse a /api/oauth/usage payload into normalized buckets plus a generic
+ * scopedLimits map (per-model weekly limits) derived from limits[]. Pure — no
+ * I/O — so it is unit-tested against a captured fixture.
+ */
+export function parseUsagePayload(data) {
+  const scopedLimits = {};
+  if (Array.isArray(data?.limits)) {
+    for (const lim of data.limits) {
+      if (lim?.group !== 'weekly') continue;
+      const display = lim?.scope?.model?.display_name;
+      if (!display) continue;               // unscoped weekly (weekly_all) → handled by sevenDay
+      const cls = modelClass(display) || String(display).toLowerCase();
+      // [R2] MINOR-1: limits[].percent is DEFINITIVELY a 0–100 scale, so divide
+      // directly (clamped) — do NOT reuse normalizeUsageBucket's ">1 ? /100 : x"
+      // heuristic, which would read percent:1 (a 1%-used scope) as 1.0 = 100%.
+      const pct = typeof lim.percent === 'number' ? lim.percent : parseFloat(lim.percent);
+      const utilization = Number.isFinite(pct) ? Math.max(0, Math.min(1, pct / 100)) : null;
+      scopedLimits[cls] = {
+        utilization,
+        resetAt: normalizeUsageBucket({ resets_at: lim.resets_at })?.resetAt ?? null,
+        severity: lim.severity ?? null,
+        isActive: !!lim.is_active,
+      };
+    }
+  }
+  return {
+    fiveHour: normalizeUsageBucket(data?.five_hour),
+    sevenDay: normalizeUsageBucket(data?.seven_day),
+    sevenDaySonnet: normalizeUsageBucket(data?.seven_day_sonnet),
+    scopedLimits,
+  };
+}
+
+/**
  * Fetch OAuth subscription usage from the usage endpoint. This reports quota
  * utilization WITHOUT spending message quota, which is what makes it safe to
  * poll. Returns normalized { fiveHour, sevenDay, sevenDaySonnet } buckets, or
@@ -199,11 +234,7 @@ export async function fetchUsage(accessToken) {
     }
 
     const data = await res.json();
-    return {
-      fiveHour: normalizeUsageBucket(data?.five_hour),
-      sevenDay: normalizeUsageBucket(data?.seven_day),
-      sevenDaySonnet: normalizeUsageBucket(data?.seven_day_sonnet),
-    };
+    return parseUsagePayload(data);
   } catch (err) {
     return { error: err.message || String(err), status: null };
   }
