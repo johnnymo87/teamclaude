@@ -10,9 +10,9 @@ function oauth(name, extra = {}) {
 
 // ── normalizeUsageBucket ──────────────────────────────────────
 
-test('normalizeUsageBucket converts percentages and fractions to 0-1', () => {
+test('normalizeUsageBucket converts percentages to 0-1', () => {
   assert.equal(normalizeUsageBucket({ used_percentage: 42 }).utilization, 0.42);
-  assert.equal(normalizeUsageBucket({ utilization: 0.5 }).utilization, 0.5);
+  assert.equal(normalizeUsageBucket({ utilization: 50 }).utilization, 0.5);
   assert.equal(normalizeUsageBucket({ used_percentage: '30' }).utilization, 0.3);
   assert.equal(normalizeUsageBucket(null), null);
   assert.equal(normalizeUsageBucket({}).utilization, null);

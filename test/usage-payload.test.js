@@ -42,9 +42,20 @@ test('[R2] scoped percent uses the 0–100 scale at the boundary (1 → 0.01, no
 });
 
 test('ignores session/non-weekly and unscoped limits; tolerates missing limits[]', () => {
-  // NOTE: payload percents are 0–100; normalizeUsageBucket only divides when >1,
-  // so use an unambiguous value (50 → 0.5), never exactly 1 (1% vs 100% is ambiguous).
+  // NOTE: payload percents are 0–100; ambiguity is now resolved (1 -> 0.01).
+  // Keep using an unambiguous value (50 → 0.5) to verify.
   const u = parseUsagePayload({ five_hour: { utilization: 50 } });
   assert.deepEqual(u.scopedLimits, {});
   assert.equal(u.fiveHour.utilization, 0.5);
+});
+
+test('[r208] unified buckets use the 0-100 scale at the boundary (1 -> 0.01, not 1.0)', () => {
+  // /api/oauth/usage five_hour/seven_day/seven_day_sonnet report utilization 0-100.
+  // A 1%-used account returns utilization:1.0; the old `>1 ? /100 : x` heuristic
+  // wrongly kept it as 1.0 (=100%), benching a healthy account from failover.
+  assert.equal(parseUsagePayload({ seven_day: { utilization: 1 } }).sevenDay.utilization, 0.01);
+  assert.equal(parseUsagePayload({ five_hour: { utilization: 1 } }).fiveHour.utilization, 0.01);
+  assert.equal(parseUsagePayload({ seven_day: { utilization: 100 } }).sevenDay.utilization, 1.0);
+  assert.equal(parseUsagePayload({ seven_day: { utilization: 0 } }).sevenDay.utilization, 0);
+  assert.equal(parseUsagePayload({ seven_day: { utilization: 27 } }).sevenDay.utilization, 0.27);
 });
