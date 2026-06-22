@@ -541,6 +541,25 @@ export class AccountManager {
     console.log(`[TeamClaude] Account "${account.name}" rate limited for ${retryAfterSeconds}s`);
   }
 
+  /** Reactively mark a model class exhausted for an account (backstop path). */
+  markScopeExhausted(accountIndex, modelClass, resetAtMs = null) {
+    const account = this.accounts[accountIndex];
+    if (!account || !modelClass) return;
+    account.quota.scopedLimits ||= {};
+    // [R2.1] MINOR-A: ALWAYS give a reactive mark a bounded reset. If neither the
+    // response nor the unified weekly window tells us when it lifts, fall back to a
+    // 7-day window (the max Opus weekly span; design §6 m2 "approximate reset") so
+    // _clearExpiredQuotas can eventually drop it — never leave resetAt:null, which
+    // would make the entry non-expiring (it only sweeps truthy resetAt).
+    const WEEKLY_MS = 7 * 86400_000;
+    account.quota.scopedLimits[modelClass] = {
+      utilization: 1,
+      resetAt: resetAtMs ?? account.quota.unified7dReset ?? (Date.now() + WEEKLY_MS),
+      severity: 'high', isActive: true,
+    };
+    console.log(`[TeamClaude] Marked "${account.name}" ${modelClass} scope exhausted (reactive backstop)`);
+  }
+
   /**
    * Ensure an OAuth account's token is fresh, refreshing if needed.
    * Pass force=true to refresh regardless of expiry (e.g. after a 401).

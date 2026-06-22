@@ -35,3 +35,24 @@ test('_clearExpiredQuotas drops a scoped entry whose reset passed', () => {
   assert.equal(am.accounts[0].quota.scopedLimits.opus, undefined);   // expired → removed
   assert.ok(am.accounts[0].quota.scopedLimits.sonnet);               // future → kept
 });
+
+test('markScopeExhausted sets the class exhausted with a reset', () => {
+  const am = new AccountManager([oauth('a')], 0.98, 0.90);
+  const reset = Date.now() + 3600_000;
+  am.markScopeExhausted(0, 'opus', reset);
+  const sl = am.accounts[0].quota.scopedLimits.opus;
+  assert.equal(sl.utilization, 1);
+  assert.equal(sl.isActive, true);
+  assert.equal(sl.resetAt, reset);
+});
+
+test('[R2.1] MINOR-A: markScopeExhausted with no known reset gets a BOUNDED (non-null) resetAt', () => {
+  const am = new AccountManager([oauth('a')], 0.98, 0.90);
+  am.markScopeExhausted(0, 'opus', null);            // no resetAtMs, no unified7dReset
+  const sl = am.accounts[0].quota.scopedLimits.opus;
+  assert.ok(sl.resetAt > Date.now(), 'must be a future bound, never null');
+  // and _clearExpiredQuotas must be able to eventually drop it
+  am.accounts[0].quota.scopedLimits.opus.resetAt = Date.now() - 1;
+  am._clearExpiredQuotas(am.accounts[0]);
+  assert.equal(am.accounts[0].quota.scopedLimits.opus, undefined);
+});
