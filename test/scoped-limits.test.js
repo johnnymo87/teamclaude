@@ -24,3 +24,14 @@ test('applyUsageData with no scopedLimits leaves the map untouched', () => {
   am.applyUsageData(0, { sevenDay: { utilization: 0.2, resetAt: 2 } }); // probe w/o limits[]
   assert.equal(am.accounts[0].quota.scopedLimits.sonnet.utilization, 0.1);
 });
+
+test('_clearExpiredQuotas drops a scoped entry whose reset passed', () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  am.applyUsageData(0, { scopedLimits: {
+    opus:   { utilization: 1, resetAt: Date.now() - 1000, severity: 'high', isActive: true },
+    sonnet: { utilization: 0.1, resetAt: Date.now() + 3600_000, severity: 'normal', isActive: false },
+  }});
+  am._clearExpiredQuotas(am.accounts[0]);
+  assert.equal(am.accounts[0].quota.scopedLimits.opus, undefined);   // expired → removed
+  assert.ok(am.accounts[0].quota.scopedLimits.sonnet);               // future → kept
+});

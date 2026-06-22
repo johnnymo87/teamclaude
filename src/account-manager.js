@@ -157,6 +157,15 @@ export class AccountManager {
       changed = true;
     }
 
+    if (q.scopedLimits) {
+      for (const [cls, sl] of Object.entries(q.scopedLimits)) {
+        if (sl?.resetAt && now >= sl.resetAt) {
+          delete q.scopedLimits[cls];
+          changed = true;
+        }
+      }
+    }
+
     return { changed, session };
   }
 
