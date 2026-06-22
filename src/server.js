@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { ensureCerts, createConnectHandler } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { BodyWriter } from './request-log.js';
-import { modelClass } from './account-manager.js';
+import { modelClass } from './model-class.js';
 import { classifyLimitResponse } from './limit-classify.js';
 
 
