@@ -336,6 +336,31 @@ export class AccountManager {
     return best;
   }
 
+  /** Soonest reset across every known window for one account (ms epoch), or null.
+   *  Single source of truth for "when could this account come back". With
+   *  { onlyFuture: true } it ignores already-passed timestamps — use that for
+   *  retry-after (we never want to advertise a past/1s window because an unpaired
+   *  stale field, e.g. unified7dReset set without unified7d, dragged the min into
+   *  the past). The reactivation path leaves it false so it can DETECT a past
+   *  reset (see MINOR-2 guard). [R2.1] MINOR-C. */
+  _soonestResetMs(account, { onlyFuture = false } = {}) {
+    const q = account.quota;
+    const candidates = [
+      account.rateLimitedUntil,
+      q.unified5hReset, q.unified7dReset, q.unified7dSonnetReset,
+      q.resetsAt ? new Date(q.resetsAt).getTime() : null,
+    ];
+    if (q.scopedLimits) for (const sl of Object.values(q.scopedLimits)) candidates.push(sl?.resetAt ?? null);
+    const now = Date.now();
+    let soonest = null;
+    for (const c of candidates) {
+      if (c == null || !Number.isFinite(c)) continue;
+      if (onlyFuture && c <= now) continue;
+      if (soonest == null || c < soonest) soonest = c;
+    }
+    return soonest;
+  }
+
   _selectNext() {
     const best = this._pickBestAvailable();
     if (best) {
@@ -353,20 +378,16 @@ export class AccountManager {
     // All accounts unavailable — find the one that resets soonest
     let soonestAccount = null;
     let soonestTime = Infinity;
-
     for (const account of this.accounts) {
-      const resetTime = account.rateLimitedUntil
-        || account.quota.unified5hReset
-        || account.quota.unified7dReset
-        || (account.quota.resetsAt ? new Date(account.quota.resetsAt).getTime() : null);
-
-      if (resetTime && resetTime < soonestTime) {
+      const resetTime = this._soonestResetMs(account);
+      if (resetTime != null && resetTime < soonestTime) {
         soonestTime = resetTime;
         soonestAccount = account;
       }
     }
 
-    if (soonestAccount && soonestTime <= Date.now()) {
+    if (soonestAccount && soonestTime <= Date.now() &&
+        (!soonestAccount.rateLimitedUntil || soonestAccount.rateLimitedUntil <= Date.now())) {
       soonestAccount.status = 'active';
       soonestAccount.rateLimitedUntil = null;
       this.currentIndex = soonestAccount.index;
