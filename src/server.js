@@ -6,6 +6,7 @@ import { ensureCerts, createConnectHandler } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { BodyWriter } from './request-log.js';
 import { modelClass } from './account-manager.js';
+import { classifyLimitResponse } from './limit-classify.js';
 
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -366,7 +367,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // whole (potentially ~1M-token) SSE body in memory.
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
-      await streamResponse(upstreamRes.body, res, account.index, accountManager, bw);
+      await streamResponse(upstreamRes.body, res, account.index, accountManager, bw, modelClass);
       l?.end();
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
@@ -412,7 +413,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
-async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter) {
+async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, modelClass) {
   const reader = webStream.getReader();
   const decoder = new TextDecoder();
   let sseBuffer = '';
@@ -439,7 +440,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
       sseBuffer = events.pop(); // keep incomplete event
 
       for (const event of events) {
-        parseSSEUsage(event, accountIndex, accountManager);
+        parseSSEUsage(event, accountIndex, accountManager, modelClass);
       }
 
       // Handle backpressure — also bail out if client disconnects,
@@ -455,7 +456,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
 
     // Parse any remaining buffer
     if (sseBuffer.trim()) {
-      parseSSEUsage(sseBuffer, accountIndex, accountManager);
+      parseSSEUsage(sseBuffer, accountIndex, accountManager, modelClass);
     }
   } finally {
     // Cancel upstream reader to stop consuming data nobody needs
@@ -464,7 +465,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
   }
 }
 
-function parseSSEUsage(event, accountIndex, accountManager) {
+function parseSSEUsage(event, accountIndex, accountManager, modelClass) {
   const dataLine = event.split('\n').find(l => l.startsWith('data: '));
   if (!dataLine) return;
 
@@ -474,6 +475,12 @@ function parseSSEUsage(event, accountIndex, accountManager) {
       accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
     } else if (data.type === 'message_delta' && data.usage) {
       accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
+    } else if (data.type === 'error' && modelClass) {
+      const c = classifyLimitResponse(200, {}, data);
+      if (c.kind === 'usage_limit') {
+        console.log(`[TeamClaude] Mid-stream usage-limit (${c.scope || modelClass}) — marking scope`);
+        accountManager.markScopeExhausted(accountIndex, c.scope || modelClass, null);
+      }
     }
   } catch {
     // not valid JSON, skip

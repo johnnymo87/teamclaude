@@ -52,3 +52,35 @@ test('a body without a model falls back to unified-only selection (no throw)', a
     assert.equal(res.status, 200);
   } finally { proxy.close(); upstream.close(); }
 });
+
+test('mid-stream SSE usage-limit error in a 200 response reactively marks the scope', async () => {
+  const upstream = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end('data: {"type":"error","error":{"type":"rate_limit_error","message":"The usage limit has been reached"}}\n\n');
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 'tok-a', expiresAt: Date.now() + 3600_000 }
+  ], 0.98, 0.90);
+  am.accounts[0].quota.unified7dReset = Date.now() + 86_400_000;
+  am.accounts[0].probing = false;
+
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+
+  try {
+    // POST an Opus request: the body uses the shared `rate_limit_error` type + the verbatim message (the design's primary shape)
+    // [R2] MAJOR-1: prove the classifier is NOT gated on status===429 (this mid-stream arm classifies with status=200)
+    await (await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-opus-4-8', messages: [] })
+    })).text();
+
+    assert.equal(am.accounts[0].quota.scopedLimits?.opus?.utilization, 1);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
