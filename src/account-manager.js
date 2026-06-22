@@ -10,6 +10,7 @@ const PERSISTED_QUOTA_FIELDS = [
   'unified5h', 'unified7d', 'unified7dSonnet',
   'unified5hReset', 'unified7dReset', 'unified7dSonnetReset', 'unifiedStatus',
   'tokensLimit', 'tokensRemaining', 'requestsLimit', 'requestsRemaining', 'resetsAt',
+  'scopedLimits',
 ];
 
 function emptyQuota() {
@@ -28,6 +29,7 @@ function emptyQuota() {
     unified7dSonnetReset: null, // ms timestamp
     unifiedStatus: null,        // allowed | allowed_warning | rejected
     resetsAt: null,
+    scopedLimits: {},
   };
 }
 
@@ -437,6 +439,10 @@ export class AccountManager {
     if (usage.sevenDaySonnet) {
       if (usage.sevenDaySonnet.utilization != null) q.unified7dSonnet = usage.sevenDaySonnet.utilization;
       if (usage.sevenDaySonnet.resetAt != null) q.unified7dSonnetReset = usage.sevenDaySonnet.resetAt;
+    }
+
+    if (usage.scopedLimits && typeof usage.scopedLimits === 'object') {
+      q.scopedLimits = { ...q.scopedLimits, ...usage.scopedLimits };
     }
 
     // If we just learned this account's weekly window while probing, re-evaluate
