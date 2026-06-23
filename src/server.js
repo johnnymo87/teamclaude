@@ -326,9 +326,22 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // Terminal: buffer the body ONCE to distinguish a per-account usage limit
       // (→ mark scope, re-dispatch) from the IP-keyed throttle (→ back off).
       if (retryCount >= maxRetries) {
+        const rawBody = Buffer.from(await upstreamRes.arrayBuffer());
         let bodyJson = null;
-        try { bodyJson = JSON.parse(await upstreamRes.text()); } catch { bodyJson = null; }
+        try { bodyJson = JSON.parse(rawBody.toString('utf8')); } catch { bodyJson = null; }
         const headers = Object.fromEntries(upstreamRes.headers.entries());
+        // Persist the terminal 429 (head + status + headers + body) to the
+        // request log BEFORE classify. The success path's logging (below) never
+        // runs on a 429, and the body is otherwise read-and-discarded here — so
+        // without this a real reactive usage-limit 429 wire-shape never reaches
+        // disk (workstation-yw6j; unblocks Phase 7 capture / workstation-sp1h).
+        logRequestHead();
+        const l = getLog();
+        if (l) {
+          l.write(`\n\n=== RESPONSE 429 ===\n${formatHeaders(upstreamRes.headers)}`);
+          l.body('RESPONSE BODY', rawBody, upstreamRes.headers.get('content-type') || '');
+          l.end();
+        }
         const c = classifyLimitResponse(429, headers, bodyJson);
         if (c.kind === 'usage_limit' && modelClass) {
           const resetMs = scopedResetFromHeaders(headers);   // approximate; limits[].resets_at not in headers
