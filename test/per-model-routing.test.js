@@ -225,3 +225,20 @@ test('setRoutes normalizes shapes and is re-appliable on reload', () => {
   am.setRoutes(undefined);                                  // reload with none
   assert.deepEqual(am.routes, []);
 });
+
+test('recovery fallback skips accounts whose advisor family bucket is spent', () => {
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
+  const now = Date.now();
+  // Both accounts over weekly threshold (so _pickBestAvailable returns null)
+  am.accounts[0].quota.unified7d = 0.99;
+  am.accounts[0].quota.unified7dReset = now - 1000; // a resets sooner
+  am.accounts[0].quota.unified7dFable = 1.0; // a's Fable bucket is spent!
+
+  am.accounts[1].quota.unified7d = 0.99;
+  am.accounts[1].quota.unified7dReset = now - 500; // b resets later
+  am.accounts[1].quota.unified7dFable = 0.2; // b's Fable bucket is NOT spent
+
+  // Call _selectNext with model=OPUS, advisorModel=FABLE
+  const selected = am._selectNext(null, OPUS, FABLE);
+  assert.equal(selected?.name, 'b');
+});
