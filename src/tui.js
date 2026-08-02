@@ -519,6 +519,12 @@ export class TUI {
       this._addLog('Invalid interval — enter 0 (off) or seconds'); this.mode = 'settings'; if (this.running) this.render(); return;
     }
     if (secs > 0 && secs < 30) secs = 30; // match the CLI minimum (don't hammer the usage endpoint)
+    if (this.am.routingStrategy === 'balanced' && secs === 0) {
+      this._addLog('Error: "balanced" strategy requires quota probe > 0');
+      this.mode = 'settings';
+      if (this.running) this.render();
+      return;
+    }
     this.config.quotaProbeSeconds = secs;
     try { await this.saveConfig(this.config); }
     catch (e) { this._addLog(`Failed to save: ${e.message}`); }

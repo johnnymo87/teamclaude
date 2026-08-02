@@ -116,7 +116,8 @@ export class AccountManager {
     this.sessionTracker = sessionTracker || new SessionTracker();
     this.distributeSessions = !!distributeSessions;
     this.routingStrategy = routingStrategy;
-    this.weeklyBalanceMargin = Number(weeklyBalanceMargin) || 0.10;
+    const margin = Number(weeklyBalanceMargin);
+    this.weeklyBalanceMargin = Number.isFinite(margin) && margin >= 0 ? margin : 0.10;
     this._lastDetourTarget = new Map(); // key: weekly bucket -> account index
     // Ephemeral per-route manual pins (routeName → account index). Not persisted:
     // like the global manual switch (currentIndex) these are runtime overrides that
@@ -424,14 +425,19 @@ export class AccountManager {
       return { account: best, action: 'recovery' };
     }
 
-    // 3. Priority preemption (operator intent, beats the margin)
+    const globalBest = this._pickBestAvailableBalanced(exclude, null, null);
     const best = this._pickBestAvailable(exclude, model, advisorModel);
-    if (best && (best.priority || 0) < (current.priority || 0)) {
+
+    const isGlobalWinner = best && globalBest && best.index === globalBest.index;
+
+    // 3. Priority preemption (operator intent, beats the margin)
+    // Note: deliberate skip of spill guards (5h < 0.90 / paused) to match drain parity (operator opt-in).
+    if (isGlobalWinner && (best.priority || 0) < (current.priority || 0)) {
       return { account: best, action: 'rank' };
     }
 
     // 4. Rank move (hysteresis)
-    if (best && best.index !== current.index) {
+    if (isGlobalWinner && best.index !== current.index) {
       const Ws = this._computeAllW();
       const wCurrent = Ws[current.index].value;
       const wBest = Ws[best.index].value;
@@ -477,6 +483,16 @@ export class AccountManager {
           const wInfo = Ws[account.index];
           const reasonTag = action === 'rank' ? 'rank' : 'recovery';
           console.log(`[TeamClaude] Switched to account "${account.name}" [${reasonTag}] (W=${wInfo.value.toFixed(2)} provenance=${wInfo.provenance})`);
+        }
+      } else if (account.index !== this.currentIndex) {
+        const bucket = this._weeklyBucketFor(model);
+        const prevDetourTarget = this._lastDetourTarget.get(bucket);
+        if (prevDetourTarget !== account.index) {
+          this._lastDetourTarget.set(bucket, account.index);
+          this._beginRamp(account);
+          const Ws = this._computeAllW();
+          const wInfo = Ws[account.index];
+          console.log(`[TeamClaude] Detour (${action}) to account "${account.name}" for bucket ${bucket} (W=${wInfo.value.toFixed(2)} provenance=${wInfo.provenance})`);
         }
       }
       return account;
@@ -583,7 +599,9 @@ export class AccountManager {
   }
 
   /** Reset timestamp (ms) of the weekly bucket that governs `model`, falling back
-   * to the shared weekly reset. Used to spend the soonest-expiring quota first. */
+   * to the shared weekly reset. Used to spend the soonest-expiring quota first.
+   * Note: returns family reset even when F2 max() means unified7d is the binding value
+   * (cosmetic, ties only). */
   _governingWeeklyReset(account, model) {
     const q = account.quota;
     const key = this._weeklyBucketFor(model);
@@ -1480,11 +1498,15 @@ export class AccountManager {
     } else if (this.currentIndex > index) {
       this.currentIndex--;
     }
-    // Keep route pins pointing at the right account after the index shift: drop a
-    // pin on the removed account, decrement pins that sat above it.
+    // Keep route pins and detour targets pointing at the right account after the index shift:
+    // drop entries on the removed account, decrement entries that sat above it.
     for (const [name, idx] of [...this.routePins.entries()]) {
       if (idx === index) this.routePins.delete(name);
       else if (idx > index) this.routePins.set(name, idx - 1);
+    }
+    for (const [bucket, idx] of [...this._lastDetourTarget.entries()]) {
+      if (idx === index) this._lastDetourTarget.delete(bucket);
+      else if (idx > index) this._lastDetourTarget.set(bucket, idx - 1);
     }
   }
 

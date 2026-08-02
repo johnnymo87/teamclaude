@@ -259,6 +259,9 @@ async function serverCommand() {
   const reloadAccounts = async () => {
     const diskConfig = await loadConfig();
     if (!diskConfig) return 0;
+    if (diskConfig.routingStrategy && diskConfig.routingStrategy !== accountManager.routingStrategy) {
+      console.log('[TeamClaude] routingStrategy change requires a restart');
+    }
     const added = await syncAccountsFromDisk(diskConfig, config, accountManager);
     // Pick up route table edits (teamclaude route …, TUI editor, or a hand edit).
     config.routes = diskConfig.routes || [];
@@ -272,9 +275,14 @@ async function serverCommand() {
       else { sx.disable(); await sx.setMode(diskSxMode); }
     }
     if (prober) {
-      const ms = (diskConfig.quotaProbeSeconds || 0) * 1000;
-      if (ms !== prober.intervalMs) {
+      let ms = (diskConfig.quotaProbeSeconds || 0) * 1000;
+      if (accountManager.routingStrategy === 'balanced' && ms <= 0) {
+        console.error('[TeamClaude] Error: "balanced" routing strategy requires quotaProbeSeconds > 0. Keeping existing prober interval.');
+        ms = prober.intervalMs || 60_000;
+      } else {
         config.quotaProbeSeconds = diskConfig.quotaProbeSeconds || 0;
+      }
+      if (ms !== prober.intervalMs) {
         prober.reschedule(ms);
       }
     }
@@ -1031,6 +1039,11 @@ async function probeCommand() {
       console.error('Minimum probe interval is 30s (to avoid hammering the usage endpoint).');
       process.exit(1);
     }
+  }
+
+  if (config.routingStrategy === 'balanced' && seconds === 0) {
+    console.error('Error: "balanced" routing strategy requires quotaProbeSeconds > 0.');
+    process.exit(1);
   }
 
   config.quotaProbeSeconds = seconds;

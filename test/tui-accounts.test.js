@@ -178,3 +178,12 @@ test('select mode entered from the dashboard still returns to normal', () => {
   tui._key('esc');
   assert.equal(tui.mode, 'normal');
 });
+
+test('TUI _doSetProbe rejects 0 seconds when routingStrategy is balanced', async () => {
+  const { tui, config } = makeTUI();
+  tui.am.routingStrategy = 'balanced';
+  config.quotaProbeSeconds = 60;
+  await tui._doSetProbe('0');
+  assert.equal(config.quotaProbeSeconds, 60);
+  assert.ok(tui.log.some(l => l.msg.includes('Error: "balanced" strategy requires quota probe > 0')));
+});
