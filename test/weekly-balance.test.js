@@ -291,3 +291,37 @@ test('removeAccount remaps _lastDetourTarget map indices', () => {
   am.removeAccount(0);
   assert.equal(am._lastDetourTarget.get('unified7dFable'), undefined);
 });
+
+test('stuck-pointer regression: balancing happens under single-family traffic when globalBest is inadmissible', () => {
+  const am = new AccountManager([oauth('x'), oauth('a'), oauth('b')], 0.98, { routingStrategy: 'balanced', weeklyBalanceMargin: 0.10 });
+  am.accounts[0].quota.unified7d = 0.10;
+  am.accounts[0].quota.unified7dFable = 1.0; // X is globalBest for W, but Fable-gated
+  am.accounts[1].quota.unified7d = 0.60;     // A (current)
+  am.accounts[2].quota.unified7d = 0.40;     // B (target, margin 0.20 below A)
+
+  am.currentIndex = 1; // start on A
+
+  const acc = am.getActiveAccount(null, FABLE);
+  assert.equal(acc.name, 'b');
+  assert.equal(am.currentIndex, 2, 'pointer moved from A to B under single-family traffic');
+});
+
+test('_lastDetourTarget is cleared on mutating switch', () => {
+  const am = new AccountManager([oauth('a'), oauth('b'), oauth('c')], 0.98, { routingStrategy: 'balanced', weeklyBalanceMargin: 0.10 });
+  am.currentIndex = 0;
+  am.accounts[0].quota.unified7d = 0.20;
+  am.accounts[0].quota.unified7dFable = 1.0; // Fable detour to b
+  am.accounts[1].quota.unified7d = 0.20;
+  am.accounts[2].quota.unified7d = 0.20;
+
+  // Off-pointer Fable serve detours to b (index 1)
+  am.getActiveAccount(null, FABLE);
+  assert.equal(am._lastDetourTarget.get('unified7dFable'), 1);
+
+  // Now a's W increases so a mutating switch to b occurs on next request
+  am.accounts[0].quota.unified7d = 0.80; // W(a) = 0.80, W(b) = 0.20 -> margin move
+  am.getActiveAccount(null, OPUS);
+  assert.equal(am.currentIndex, 1, 'mutating switch moved pointer to b');
+  assert.equal(am._lastDetourTarget.get('unified7dFable'), undefined, '_lastDetourTarget cleared on mutating switch');
+});
+

@@ -437,7 +437,12 @@ export class AccountManager {
     }
 
     // 4. Rank move (hysteresis)
-    if (isGlobalWinner && best.index !== current.index) {
+    // Proof that no cycle is possible: in any cycle the total priority change is zero.
+    // Preemption edges strictly decrease priority; margin edges never increase it.
+    // Therefore every edge in a cycle must be a same-priority margin move. Each such
+    // move descends W by at least the margin, so the cycle's total W change is strictly
+    // negative — a contradiction. Hence no cycle.
+    if (best && best.index !== current.index && (best.priority || 0) <= (current.priority || 0)) {
       const Ws = this._computeAllW();
       const wCurrent = Ws[current.index].value;
       const wBest = Ws[best.index].value;
@@ -478,6 +483,7 @@ export class AccountManager {
         this.currentIndex = account.index;
         account.probing = account.quota.unified7dReset == null;
         if (switched) {
+          this._lastDetourTarget.clear();
           this._beginRamp(account);
           const Ws = this._computeAllW();
           const wInfo = Ws[account.index];
