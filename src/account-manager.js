@@ -100,7 +100,7 @@ function modelMatches(declared, model) {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker, routingStrategy = 'drain', weeklyBalanceMargin = 0.10 } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -115,6 +115,9 @@ export class AccountManager {
     // accounts by load instead of funnelling them all onto the current one.
     this.sessionTracker = sessionTracker || new SessionTracker();
     this.distributeSessions = !!distributeSessions;
+    this.routingStrategy = routingStrategy;
+    this.weeklyBalanceMargin = Number(weeklyBalanceMargin) || 0.10;
+    this._lastDetourTarget = new Map(); // key: weekly bucket -> account index
     // Ephemeral per-route manual pins (routeName → account index). Not persisted:
     // like the global manual switch (currentIndex) these are runtime overrides that
     // bias selection for a route's models and reset on restart. A pinned account
@@ -248,7 +251,7 @@ export class AccountManager {
       if (acc) return acc;
     }
     if (advisorModel) {
-      const account = this._select(exclude, model, advisorModel, false);
+      const account = this._select(exclude, model, advisorModel, false, false);
       if (account) return account;
       // Throttled so a busy advisor session doesn't flood the activity log.
       if (Date.now() >= (this._advisorDegradeLogAt || 0)) {
@@ -256,14 +259,18 @@ export class AccountManager {
         console.log(`[TeamClaude] No account eligible for advisor model "${advisorModel}" — routing by request model only`);
       }
     }
-    return this._select(exclude, model, null, true);
+    return this._select(exclude, model, null, true, true);
   }
 
   /** The selection walk getActiveAccount runs: manual pin → current account →
    * best-available. `allowProbe` gates the exhausted-fleet probe fallback so the
    * advisor-constrained pass can fail soft (degrade to executor-only) instead of
    * burning the throttled probe slot on the stricter constraint. */
-  _select(exclude, model, advisorModel, allowProbe) {
+  _select(exclude, model, advisorModel, allowProbe = true, mayMutate = allowProbe) {
+    if (this.routingStrategy === 'balanced') {
+      return this._selectBalanced(exclude, model, advisorModel, allowProbe, mayMutate);
+    }
+
     // A manual per-route pin biases selection for that route's models (independent
     // of the global currentIndex). Honored only while eligible — otherwise we fall
     // through to normal best-available selection so requests keep flowing.
@@ -398,6 +405,102 @@ export class AccountManager {
   }
 
   /**
+   * Pure, non-mutating resolver for balanced routing.
+   * Returns { account, action } where action is 'pin' | 'current' | 'rank' | 'detour' | 'recovery' | null.
+   */
+  _resolveBalanced(exclude = null, model = null, advisorModel = null) {
+    // 1. Manual route pin
+    const pinned = this._pinnedAccountForModel(model, advisorModel);
+    if (pinned && this._isAvailable(pinned, model, advisorModel) && !exclude?.has(pinned.index)) {
+      return { account: pinned, action: 'pin' };
+    }
+
+    const current = this.accounts[this.currentIndex];
+
+    // 2. Is current usable model-INDEPENDENTLY?
+    const currentUsableModelIndependent = current && !exclude?.has(current.index) && this._isAvailable(current, null, null);
+    if (!currentUsableModelIndependent) {
+      const best = this._pickBestAvailable(exclude, model, advisorModel);
+      return { account: best, action: 'recovery' };
+    }
+
+    // 3. Priority preemption (operator intent, beats the margin)
+    const best = this._pickBestAvailable(exclude, model, advisorModel);
+    if (best && (best.priority || 0) < (current.priority || 0)) {
+      return { account: best, action: 'rank' };
+    }
+
+    // 4. Rank move (hysteresis)
+    if (best && best.index !== current.index) {
+      const Ws = this._computeAllW();
+      const wCurrent = Ws[current.index].value;
+      const wBest = Ws[best.index].value;
+
+      if (wCurrent - wBest >= this.weeklyBalanceMargin) {
+        const unified5hOk = best.quota.unified5h == null || best.quota.unified5h < 0.90;
+        const notPaused = !best.pausedUntil || Date.now() >= best.pausedUntil;
+
+        if (unified5hOk && notPaused) {
+          return { account: best, action: 'rank' };
+        }
+      }
+    }
+
+    // 5. Current serves this request
+    if (this._isAvailable(current, model, advisorModel) && !exclude?.has(current.index)) {
+      return { account: current, action: 'current' };
+    }
+
+    // 6. Detour
+    if (best) {
+      return { account: best, action: 'detour' };
+    }
+
+    return { account: null, action: null };
+  }
+
+  _selectBalanced(exclude, model, advisorModel, allowProbe, mayMutate) {
+    const { account, action } = this._resolveBalanced(exclude, model, advisorModel);
+
+    if (!account) {
+      return allowProbe ? this._selectProbe(exclude, model) : null;
+    }
+
+    if (action === 'rank' || action === 'recovery') {
+      if (mayMutate) {
+        const switched = account.index !== this.currentIndex;
+        this.currentIndex = account.index;
+        account.probing = account.quota.unified7dReset == null;
+        if (switched) {
+          this._beginRamp(account);
+          const Ws = this._computeAllW();
+          const wInfo = Ws[account.index];
+          const reasonTag = action === 'rank' ? 'rank' : 'recovery';
+          console.log(`[TeamClaude] Switched to account "${account.name}" [${reasonTag}] (W=${wInfo.value.toFixed(2)} provenance=${wInfo.provenance})`);
+        }
+      }
+      return account;
+    }
+
+    if (action === 'detour') {
+      // NEVER touch currentIndex.
+      const bucket = this._weeklyBucketFor(model);
+      const prevDetourTarget = this._lastDetourTarget.get(bucket);
+      if (prevDetourTarget !== account.index) {
+        this._lastDetourTarget.set(bucket, account.index);
+        this._beginRamp(account);
+        const Ws = this._computeAllW();
+        const wInfo = Ws[account.index];
+        console.log(`[TeamClaude] Detour to account "${account.name}" for bucket ${bucket} (W=${wInfo.value.toFixed(2)} provenance=${wInfo.provenance})`);
+      }
+      return account;
+    }
+
+    // action === 'pin' or 'current'
+    return account;
+  }
+
+  /**
    * Read-only: the index of the account a request for `model` would be served by
    * right now — the same decision getActiveAccount makes (manual pin → the global
    * current account if it can serve the model → best-available), but WITHOUT
@@ -407,6 +510,11 @@ export class AccountManager {
    * the F7/S7 analogue of the ► that marks the default route's current account.
    */
   previewRouteIndex(model) {
+    if (this.routingStrategy === 'balanced') {
+      const { account } = this._resolveBalanced(null, model, null);
+      return account ? account.index : null;
+    }
+
     const pinned = this._pinnedAccountForModel(model);
     if (pinned && this._isAvailable(pinned, model)) return pinned.index;
     const current = this.accounts[this.currentIndex];
@@ -480,6 +588,55 @@ export class AccountManager {
     const q = account.quota;
     const key = this._weeklyBucketFor(model);
     return q[`${key}Reset`] || q.unified7dReset || null;
+  }
+
+  /** Compute model-INDEPENDENT pointer ranking scalar W for ALL accounts at once.
+   *  Pass 1: unified7d -> 'unified'; else max(family buckets) -> 'family-proxy'.
+   *  Pass 2: unresolved accounts get median(pass 1 resolved) -> 'median';
+   *  if NO account resolved, every account gets 0 -> 'empty'. */
+  _computeAllW() {
+    const results = new Array(this.accounts.length);
+    const pass1Resolved = [];
+
+    for (let i = 0; i < this.accounts.length; i++) {
+      const q = this.accounts[i].quota;
+      if (q.unified7d != null) {
+        const res = { value: q.unified7d, provenance: 'unified' };
+        results[i] = res;
+        pass1Resolved.push(res.value);
+      } else {
+        const familyVals = [];
+        if (q.unified7dFable != null) familyVals.push(q.unified7dFable);
+        if (q.unified7dSonnet != null) familyVals.push(q.unified7dSonnet);
+        if (familyVals.length > 0) {
+          const res = { value: Math.max(...familyVals), provenance: 'family-proxy' };
+          results[i] = res;
+          pass1Resolved.push(res.value);
+        } else {
+          results[i] = null;
+        }
+      }
+    }
+
+    if (pass1Resolved.length > 0) {
+      const sorted = [...pass1Resolved].sort((a, b) => a - b);
+      const mid = Math.floor(sorted.length / 2);
+      const medianVal = (sorted.length % 2 === 1)
+        ? sorted[mid]
+        : (sorted[mid - 1] + sorted[mid]) / 2;
+
+      for (let i = 0; i < results.length; i++) {
+        if (results[i] === null) {
+          results[i] = { value: medianVal, provenance: 'median' };
+        }
+      }
+    } else {
+      for (let i = 0; i < results.length; i++) {
+        results[i] = { value: 0, provenance: 'empty' };
+      }
+    }
+
+    return results;
   }
 
   /** True when the family-specific weekly bucket that governs `model` is spent.
@@ -829,6 +986,7 @@ export class AccountManager {
    * account's weekly limit and the account still has weekly quota to spend.
    */
   _switchOnSessionReset(candidates) {
+    if (this.routingStrategy === 'balanced') return;
     const current = this.accounts[this.currentIndex];
     // Need a known weekly reset on the current account to compare against;
     // if it is unknown we are still probing it, so leave it alone.
@@ -897,6 +1055,10 @@ export class AccountManager {
    * heuristic. Returns the account or null if none are available.
    */
   _pickBestAvailable(exclude = null, model = null, advisorModel = null) {
+    if (this.routingStrategy === 'balanced') {
+      return this._pickBestAvailableBalanced(exclude, model, advisorModel);
+    }
+
     let best = null;
     let bestPriority = Infinity;
     let bestReset = Infinity;
@@ -922,6 +1084,59 @@ export class AccountManager {
         best = account;
       }
     }
+    return best;
+  }
+
+  _pickBestAvailableBalanced(exclude = null, model = null, advisorModel = null) {
+    let best = null;
+    let Ws = null;
+
+    for (const account of this.accounts) {
+      if (exclude?.has(account.index)) continue;
+      if (!this._isAvailable(account, model, advisorModel)) continue;
+
+      if (!best) {
+        best = account;
+        continue;
+      }
+
+      // 1. priority ascending
+      const pA = account.priority || 0;
+      const pB = best.priority || 0;
+      if (pA !== pB) {
+        if (pA < pB) best = account;
+        continue;
+      }
+
+      // 2. gate metric _governingWeekly(account, model) ascending, fallback to W
+      let gA = this._governingWeekly(account, model);
+      let gB = this._governingWeekly(best, model);
+
+      if (gA == null || gB == null) {
+        if (!Ws) Ws = this._computeAllW();
+        if (gA == null) gA = Ws[account.index].value;
+        if (gB == null) gB = Ws[best.index].value;
+      }
+
+      if (gA !== gB) {
+        if (gA < gB) best = account;
+        continue;
+      }
+
+      // 3. stable tiebreak: soonest governing weekly reset, then account index
+      const rA = this._governingWeeklyReset(account, model) ?? Infinity;
+      const rB = this._governingWeeklyReset(best, model) ?? Infinity;
+
+      if (rA !== rB) {
+        if (rA < rB) best = account;
+        continue;
+      }
+
+      if (account.index < best.index) {
+        best = account;
+      }
+    }
+
     return best;
   }
 

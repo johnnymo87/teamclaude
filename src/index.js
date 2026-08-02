@@ -154,8 +154,29 @@ async function serverCommand() {
     console.error(`[TeamClaude] Deprecated: account "${acct.name}" uses "models" — replace it with a routes entry: ${JSON.stringify(route)}`);
   }
 
+  if (config.routingStrategy === 'balanced') {
+    if (!(config.quotaProbeSeconds > 0)) {
+      console.error('[TeamClaude] Fatal: "balanced" routing strategy requires "quotaProbeSeconds" > 0.\n' +
+        'Under balanced routing, ranking by utilization removes drain\'s "unknown weekly ranks first" discovery pressure, ' +
+        'so the periodic prober is the only mechanism that learns account quotas. Set "quotaProbeSeconds" (e.g. 60) in config.');
+      process.exit(1);
+    }
+    if (config.distributeSessions) {
+      console.error('[TeamClaude] Fatal: "balanced" routing strategy cannot be combined with "distributeSessions".\n' +
+        'distributeSessions ranks by session load and ignores utilization entirely, silently bypassing balanced routing. ' +
+        'Disable "distributeSessions" or set "routingStrategy": "drain".');
+      process.exit(1);
+    }
+  }
+
   const threshold = config.switchThreshold || 0.98;
-  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions });
+  const accountManager = new AccountManager(accounts, threshold, {
+    routes: config.routes,
+    ramp: config.stormRamp,
+    distributeSessions: config.distributeSessions,
+    routingStrategy: config.routingStrategy,
+    weeklyBalanceMargin: config.weeklyBalanceMargin,
+  });
 
   // Restore quota observed in a previous run so a restart doesn't lose rotation
   // state (passive — we never call the API to re-learn it). Stale windows are
