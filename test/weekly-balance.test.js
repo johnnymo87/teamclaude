@@ -137,6 +137,30 @@ test('5. Advisor pass never mutates', () => {
   const acc = am.getActiveAccount(null, OPUS, FABLE);
   assert.equal(acc.name, 'b');
   assert.equal(am.currentIndex, 0, 'pass 1 was read-only, currentIndex untouched');
+  assert.notEqual(am.accounts[1].rampStartedAt, null, 'rampStartedAt set on served off-pointer account');
+});
+
+test('Finding 1 regression: gated Fable request does not rank-move pointer away from priority winner', () => {
+  const am = new AccountManager([oauth('a', { priority: 0 }), oauth('b', { priority: 1 })], 0.98, { routingStrategy: 'balanced', weeklyBalanceMargin: 0.10 });
+  am.currentIndex = 0;
+  am.accounts[0].quota.unified7d = 0.50;
+  am.accounts[0].quota.unified7dFable = 1.0; // A is Fable-gated
+  am.accounts[1].quota.unified7d = 0.30;
+  am.accounts[1].quota.unified7dFable = 0.30;
+
+  let pointerSwitches = 0;
+  let lastPointer = am.currentIndex;
+
+  for (let i = 0; i < 6; i++) {
+    const model = (i % 2 === 0) ? FABLE : OPUS;
+    am.getActiveAccount(null, model);
+    if (am.currentIndex !== lastPointer) {
+      pointerSwitches++;
+      lastPointer = am.currentIndex;
+    }
+  }
+
+  assert.ok(pointerSwitches <= 1, `expected at most 1 pointer switch, got ${pointerSwitches}`);
 });
 
 test('6. Forced all-null fleet: W is 0 empty, comparisons finite, selection returns account', () => {
@@ -218,4 +242,52 @@ test('11. Default config is drain and produces identical selections to pre-chang
   am.accounts[0].quota.unified7d = 0.50;
   am.accounts[1].quota.unified7d = 0.10;
   assert.equal(am.getActiveAccount().name, 'a', 'drain picks first available account');
+});
+
+test('Invariant 5: detour ranks by GATE metric, not W', () => {
+  const am = new AccountManager([oauth('a'), oauth('b'), oauth('c')], 0.98, { routingStrategy: 'balanced' });
+  am.currentIndex = 0;
+  // Current account A gated for Fable
+  am.accounts[0].quota.unified7d = 0.20;
+  am.accounts[0].quota.unified7dFable = 1.0;
+
+  // Account B: unified7d = 0.10 (W = 0.10), unified7dFable = 0.50 (gate metric = 0.50)
+  am.accounts[1].quota.unified7d = 0.10;
+  am.accounts[1].quota.unified7dFable = 0.50;
+
+  // Account C: unified7d = 0.30 (W = 0.30), unified7dFable = 0.20 (gate metric = 0.30)
+  am.accounts[2].quota.unified7d = 0.30;
+  am.accounts[2].quota.unified7dFable = 0.20;
+
+  // A Fable detour must pick C because gate metric for C (0.30) < gate metric for B (0.50),
+  // even though W(B) < W(C).
+  const selected = am.getActiveAccount(null, FABLE);
+  assert.equal(selected.name, 'c');
+});
+
+test('margin validation accepts 0 and defaults negatives/non-finite to 0.10', () => {
+  const amZero = new AccountManager([oauth('a')], 0.98, { weeklyBalanceMargin: 0 });
+  assert.equal(amZero.weeklyBalanceMargin, 0);
+
+  const amNeg = new AccountManager([oauth('a')], 0.98, { weeklyBalanceMargin: -0.05 });
+  assert.equal(amNeg.weeklyBalanceMargin, 0.10);
+
+  const amInvalid = new AccountManager([oauth('a')], 0.98, { weeklyBalanceMargin: 'not-a-number' });
+  assert.equal(amInvalid.weeklyBalanceMargin, 0.10);
+});
+
+test('removeAccount remaps _lastDetourTarget map indices', () => {
+  const am = new AccountManager([oauth('a'), oauth('b'), oauth('c')], 0.98, { routingStrategy: 'balanced' });
+  am.currentIndex = 0;
+  am.accounts[0].quota.unified7dFable = 1.0; // Detour Fable
+  am.getActiveAccount(null, FABLE); // Detour to b (index 1)
+  assert.equal(am._lastDetourTarget.get('unified7dFable'), 1);
+
+  // Remove account 0 (a). Account b becomes index 0, c becomes index 1.
+  am.removeAccount(0);
+  assert.equal(am._lastDetourTarget.get('unified7dFable'), 0);
+
+  // Remove account 0 (now b). The detour target for b (index 0) is deleted.
+  am.removeAccount(0);
+  assert.equal(am._lastDetourTarget.get('unified7dFable'), undefined);
 });
