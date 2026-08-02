@@ -462,13 +462,16 @@ export class AccountManager {
 
   /** Utilization (0-1) of the weekly bucket that governs `model` on this account:
    * unified7dFable for Fable, unified7dSonnet for Sonnet, unified7d otherwise.
-   * Falls back to the shared unified7d when a family-specific bucket isn't
-   * reported. Returns null when nothing is known. */
+   * Returns the max of family-specific bucket and shared unified7d, or null when
+   * nothing is known. */
   _governingWeekly(account, model) {
     const q = account.quota;
     const key = this._weeklyBucketFor(model);
-    if (q[key] != null) return q[key];
-    return key !== 'unified7d' ? q.unified7d : null;
+    if (key === 'unified7d') return q.unified7d ?? null;
+    const vKey = q[key] ?? null;
+    const vUnified = q.unified7d ?? null;
+    if (vKey != null && vUnified != null) return Math.max(vKey, vUnified);
+    return vKey ?? vUnified;
   }
 
   /** Reset timestamp (ms) of the weekly bucket that governs `model`, falling back
