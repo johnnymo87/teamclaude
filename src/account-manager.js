@@ -976,6 +976,7 @@ export class AccountManager {
       // neither the executor's nor an advisor's.
       if (model && !this._routeAllows(account, model)) continue;
       if (advisorModel && !this._routeAllows(account, advisorModel)) continue;
+      if (advisorModel && this._modelWeeklyExhausted(account, advisorModel)) continue;
       const resetTime = account.rateLimitedUntil
         || account.quota.unified5hReset
         || account.quota.unified7dReset
