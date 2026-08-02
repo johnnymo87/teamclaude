@@ -58,6 +58,8 @@ export function createDefaultConfig() {
     switchThreshold: 0.98,
     holdSeconds: 0,
     distributeSessions: false,
+    routingStrategy: 'drain',
+    weeklyBalanceMargin: 0.10,
     eventLogging: 'hide',
     blockedModels: [],
     accounts: [],
