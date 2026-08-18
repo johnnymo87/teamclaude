@@ -136,9 +136,42 @@ const DEFAULT_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 // does not repeat the same line forever.
 const seenRefreshFieldShapes = new Set();
 
+// Last grant identifier seen, so a rotation that also changes the GRANT (as
+// opposed to just the token string) is visible. Names the account nowhere: this
+// is a single slot, adequate for the question being asked.
+let lastGrantId = null;
+
 /** Test seam: forget what has already been reported. */
 export function __resetRefreshFieldReporting() {
   seenRefreshFieldShapes.clear();
+  lastGrantId = null;
+}
+
+/**
+ * Report the refresh token's own remaining lifetime, on EVERY refresh.
+ *
+ * `refresh_token_expires_in` is the field that answers whether an account is
+ * about to die. Anthropic grants appear to lapse ~30 days after login, killing
+ * the account with no warning -- a refresh succeeds normally right up until the
+ * last one fails, so the success of a refresh proves nothing about how much
+ * time is left. This value does.
+ *
+ * It is logged every time, not deduped, because the SHAPE of the series is the
+ * finding: a value that counts down means the TTL is anchored at login and each
+ * account's death date is computable; a value that resets to the same number
+ * every time means the window slides and age alone cannot kill a live token.
+ *
+ * The grant id is compared but never printed -- it is an identifier, and only
+ * its stability is interesting.
+ */
+function reportGrantTtl(data) {
+  const ttl = data.refresh_token_expires_in;
+  if (typeof ttl !== 'number') return;
+  const id = data.token_uuid ?? null;
+  const grant = lastGrantId === null ? 'first' : (id === lastGrantId ? 'same' : 'CHANGED');
+  lastGrantId = id;
+  const days = (ttl / 86400).toFixed(1);
+  console.log(`[TeamClaude] refresh grant TTL: ${ttl}s (${days}d) grant=${grant}`);
 }
 
 /**
@@ -213,6 +246,7 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
 
       const data = await res.json();
       reportRefreshFields(Object.keys(data));
+      reportGrantTtl(data);
       return {
         accessToken: data.access_token,
         refreshToken: data.refresh_token || refreshToken,
