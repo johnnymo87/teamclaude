@@ -78,3 +78,38 @@ test('a NEW field shape is reported even after an earlier one was seen', async (
   assert.equal(lines.length, 2);
   assert.match(lines[1], /grant_expires_at/);
 });
+
+test('reports the refresh-token TTL value and whether the grant id changed', async () => {
+  __resetRefreshFieldReporting();
+  const logs = [];
+  const spy = mock.method(console, 'log', msg => logs.push(String(msg)));
+  try {
+    await withServer(
+      { access_token: 'a', refresh_token: 'b', expires_in: 28800,
+        refresh_token_expires_in: 2592000, token_uuid: 'uuid-1' },
+      async url => { await refreshAccessToken('sk-old', url); },
+    );
+    await withServer(
+      { access_token: 'a', refresh_token: 'b', expires_in: 28800,
+        refresh_token_expires_in: 2588400, token_uuid: 'uuid-1' },
+      async url => { await refreshAccessToken('sk-old', url); },
+    );
+    await withServer(
+      { access_token: 'a', refresh_token: 'b', expires_in: 28800,
+        refresh_token_expires_in: 2592000, token_uuid: 'uuid-2' },
+      async url => { await refreshAccessToken('sk-old', url); },
+    );
+  } finally {
+    spy.mock.restore();
+  }
+  const ttl = logs.filter(l => l.includes('grant TTL'));
+  assert.equal(ttl.length, 3, 'the TTL must be reported on EVERY refresh, not once per shape');
+  // A countdown is the anchored-at-login case; a reset means a sliding window.
+  assert.match(ttl[0], /2592000s/);
+  assert.match(ttl[0], /29\.9d|30\.0d/);
+  assert.match(ttl[1], /2588400s/);
+  assert.match(ttl[1], /grant=same/);
+  assert.match(ttl[2], /grant=CHANGED/);
+  // The identifier itself is never printed.
+  assert.ok(!logs.join('\n').includes('uuid-1'), 'grant id leaked into the log');
+});
