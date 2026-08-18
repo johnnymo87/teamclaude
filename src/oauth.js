@@ -59,6 +59,35 @@ const OAUTH_USAGE_BETA = 'oauth-2025-04-20';
 const DEFAULT_TOKEN_ENDPOINT = 'https://platform.claude.com/v1/oauth/token';
 const DEFAULT_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 
+// Field shapes already reported by reportRefreshFields, so an hourly refresh
+// does not repeat the same line forever.
+const seenRefreshFieldShapes = new Set();
+
+/** Test seam: forget what has already been reported. */
+export function __resetRefreshFieldReporting() {
+  seenRefreshFieldShapes.clear();
+}
+
+/**
+ * Log the FIELD NAMES of a token-refresh response, once per distinct shape.
+ *
+ * We keep three fields out of that response and discard the rest. That is fine
+ * for operation but blinding for diagnosis: Anthropic OAuth refresh tokens
+ * appear to carry a ~30-day TTL anchored at login, and when it expires the
+ * account dies with no warning -- a refresh succeeds normally right up until
+ * the last one fails. If the endpoint says anything about the GRANT's lifetime
+ * (as opposed to the access token's), it is currently thrown away unseen, and
+ * nothing else locally can observe it.
+ *
+ * Names only, never values: every value in this object is a credential.
+ */
+function reportRefreshFields(keys) {
+  const shape = [...keys].sort().join(', ');
+  if (seenRefreshFieldShapes.has(shape)) return;
+  seenRefreshFieldShapes.add(shape);
+  console.log(`[TeamClaude] token refresh response fields: ${shape}`);
+}
+
 /**
  * Refresh an expired OAuth access token using the refresh token.
  * Retries on 5xx and network errors with exponential backoff.
@@ -110,6 +139,7 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
       }
 
       const data = await res.json();
+      reportRefreshFields(Object.keys(data));
       return {
         accessToken: data.access_token,
         refreshToken: data.refresh_token || refreshToken,
