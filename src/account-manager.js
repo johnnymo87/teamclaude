@@ -1160,7 +1160,8 @@ export class AccountManager {
    * the refusal was the proxy's own doing (issue #166).
    *
    * Returns one of: 'disabled', 'throttled', 'error', 'exhausted',
-   * 'upstream-rejected', 'quota', 'route', 'advisor-quota', 'advisor-route'.
+   * 'upstream-rejected', 'plan-less', 'quota', 'route', 'advisor-quota',
+   * 'advisor-route'.
    */
   unavailableReason(account, model = null, advisorModel = null) {
     if (!account) return 'error';
@@ -1195,6 +1196,13 @@ export class AccountManager {
 
     if (account.status === 'exhausted') return 'exhausted';
     if (account.status === 'error') return 'error';
+
+    // A lapsed subscription keeps its OAuth grant, so the account authenticates
+    // and reports status=active while returning no quota at all. _isNearQuota
+    // below only gates on buckets that ARE reported, so such an account was
+    // never gated and stayed selectable indefinitely — every request routed to
+    // it burns a round trip and a failover.
+    if (this._isPlanLess(account)) return 'plan-less';
     // Model-scoped: _isNearQuota checks the shared 5h bucket plus only the weekly
     // bucket that governs this model, so a spent Fable/Sonnet bucket bars just
     // that family — the account still serves every other model normally. It also
@@ -2311,6 +2319,52 @@ export class AccountManager {
     console.log(`[TeamClaude] Account "${best.name}" session quota reset and weekly expires sooner — switching to it`);
   }
 
+  /**
+   * Consecutive silent probes before an account is treated as plan-less. At the
+   * default 90s probe interval this is ~4.5 minutes, far below the hours or days
+   * a lapsed subscription persists, and far above any single-probe hiccup.
+   */
+  static get PLAN_LESS_MIN_SILENT_PROBES() { return 3; }
+
+  /**
+   * True when an account looks like it carries no plan: every weekly bucket
+   * unreported AND no 5h consumption visible.
+   *
+   * Unreported-ness alone is NOT sufficient and using it would be wrong. A
+   * healthy account can report a null unified7d for long stretches while its
+   * family or 5h buckets stay live — observed for ~1620 consecutive probes on a
+   * real account in July 2026. Requiring ALL of them silent is what separates
+   * "this plan doesn't expose that bucket" from "there is no plan".
+   *
+   * Guard: if NOTHING in the fleet reports, the quota probe has not run yet or
+   * upstream is failing to report. That is not a fleet of cancelled
+   * subscriptions, and excluding every account would empty the pool and fail
+   * every request, so the check disables itself.
+   *
+   * The exclusion is deliberately SOFT — it lives in _isAvailable, which the
+   * all-accounts-exhausted probe path deliberately bypasses. So a false
+   * positive costs the account its place in normal selection, not its place in
+   * the fleet: if everything else is unavailable it can still be chosen.
+   */
+  _isPlanLess(account) {
+    const q = account?.quota;
+    if (!q) return false;
+    const silent = q.unified7d == null
+      && q.unified7dFable == null
+      && (q.unified5h == null || q.unified5h === 0);
+    if (!silent) return false;
+    // Sustained, not instantaneous: only condemn an account after several
+    // consecutive probes have come back silent. An account that has never been
+    // probed has silentProbes 0 and is left alone.
+    if ((account.silentProbes || 0) < AccountManager.PLAN_LESS_MIN_SILENT_PROBES) return false;
+    return this.accounts.some(a => {
+      const s = a.quota;
+      if (!s) return false;
+      return s.unified7d != null || s.unified7dFable != null
+        || (s.unified5h != null && s.unified5h > 0);
+    });
+  }
+
   _isNearQuota(account, model = null) {
     const q = account.quota;
     this._clearExpiredQuotas(account);
@@ -2763,6 +2817,19 @@ export class AccountManager {
       if (spentNow && !((was?.usedMinor || 0) > 0)) {
         console.log(`[TeamClaude] Account "${account.name}" has started spending real money: ${formatMoney(q.spend)}`);
       }
+    }
+
+    // Track consecutive probes that came back completely silent. This is what
+    // makes the plan-less check SUSTAINED rather than instantaneous, and the
+    // distinction matters: an account that has simply never been probed yet — a
+    // freshly added one, or the whole fleet right after a restart — is silent
+    // for entirely innocent reasons. Judging on a single observation would
+    // exclude it during the window before its first probe lands.
+    if (q.unified7d == null && q.unified7dFable == null
+        && (q.unified5h == null || q.unified5h === 0)) {
+      account.silentProbes = (account.silentProbes || 0) + 1;
+    } else {
+      account.silentProbes = 0;
     }
 
     // If we just learned this account's weekly window while probing, re-evaluate

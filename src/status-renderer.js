@@ -108,6 +108,7 @@ export const UNAVAILABLE_TEXT = {
   route: 'no route allows this account',
   'advisor-quota': "advisor model's weekly bucket spent",
   'advisor-route': 'no route allows the advisor model',
+  'plan-less': 'reports no quota at all (lapsed subscription?)',
 };
 
 /**
