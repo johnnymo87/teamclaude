@@ -236,6 +236,28 @@ export class AccountManager {
     this.weeklyBalanceMargin = typeof weeklyBalanceMargin === 'number' && Number.isFinite(weeklyBalanceMargin)
       ? Math.max(0.02, weeklyBalanceMargin)
       : 0.10;
+
+    // Counters for margin-driven preemption outcomes (design D8, bead yri.8).
+    //
+    // Why this exists:
+    // The margin's spill guard blocks every margin move while the best candidate
+    // sits at unified5h >= 0.90 — which is exactly the fleet's busy period. In
+    // that window balanced silently behaves as drain. More generally, the failure
+    // mode this defends against is shipping "balanced" that quietly behaves as
+    // expiry or drain with nobody noticing. This must be observable, not inferred.
+    //
+    // Keys:
+    // - done: margin preemption successfully rotated cursor to lower-W candidate.
+    // - blocked_5h: candidate W had >= margin advantage but unified5h >= 0.90.
+    // - blocked_paused: candidate W had >= margin advantage but candidate is paused.
+    // - below_margin: candidate W was not lower than current W by >= weeklyBalanceMargin.
+    this.marginMove = {
+      done: 0,
+      blocked_5h: 0,
+      blocked_paused: 0,
+      below_margin: 0,
+    };
+
     // Sessions still being drained after distribution was turned off (see
     // setDistributeSessions). null = not draining; a Set of session ids otherwise.
     this._drainingSessions = null;
@@ -990,9 +1012,10 @@ export class AccountManager {
       // least weeklyBalanceMargin. Without this, the preview marker points at the
       // current account while routing rotates off it on the next selection.
       // previewRouteIndex is read-only: no cursor moves, no observations written,
-      // and no ramp started.
+      // no ramp started, and no counters incremented ({ count: false }) — otherwise
+      // marginMove would measure the TUI's poll/refresh rate rather than routing decisions.
       const marginWinner = (!better && !rolled && this.routingStrategy === 'balanced')
-        ? this._marginPreemptedBy(current, model)
+        ? this._marginPreemptedBy(current, model, null, null, null, { count: false })
         : null;
       if (!better && !rolled && !marginWinner) return current.index;
       if (marginWinner) return marginWinner.index;
@@ -1420,25 +1443,44 @@ export class AccountManager {
    * 5. _switchOnSessionReset is disabled under balanced (T3), preventing out-of-band
    *    re-ranking moves on equal W or small W differences that would violate the descent.
    */
-  _marginPreemptedBy(current, model = null, advisorModel = null, exclude = null, allW = null) {
+  _marginPreemptedBy(current, model = null, advisorModel = null, exclude = null, allW = null, options = {}) {
     if (!current || this.routingStrategy !== 'balanced') return null;
+
+    let count = true;
+    let resolvedW = allW;
+    if (options && typeof options === 'object' && 'count' in options) {
+      count = options.count !== false;
+    } else if (resolvedW && !Array.isArray(resolvedW) && typeof resolvedW === 'object' && 'count' in resolvedW) {
+      count = resolvedW.count !== false;
+      resolvedW = null;
+    }
 
     const best = this._pickBestAvailable(exclude, model, advisorModel);
     if (!best || best.index === current.index) return null;
 
     if ((best.priority || 0) > (current.priority || 0)) return null;
 
-    const W = allW || this._computeAllW();
+    const W = resolvedW || this._computeAllW();
     const wCurrent = W[current.index]?.value ?? 0;
     const wBest = W[best.index]?.value ?? 0;
-    if (wCurrent - wBest < this.weeklyBalanceMargin) return null;
+    if (wCurrent - wBest < this.weeklyBalanceMargin) {
+      if (count) this.marginMove.below_margin++;
+      return null;
+    }
 
     const unified5hOk = best.quota?.unified5h == null || best.quota.unified5h < 0.90;
-    if (!unified5hOk) return null;
+    if (!unified5hOk) {
+      if (count) this.marginMove.blocked_5h++;
+      return null;
+    }
 
     const notPaused = !best.pausedUntil || Date.now() >= best.pausedUntil;
-    if (!notPaused) return null;
+    if (!notPaused) {
+      if (count) this.marginMove.blocked_paused++;
+      return null;
+    }
 
+    if (count) this.marginMove.done++;
     return best;
   }
 
@@ -3365,6 +3407,50 @@ export class AccountManager {
   }
 
   /**
+   * Current max(W) - min(W) per provider (design D8 and [O1] corollary).
+   *
+   * Why per-provider:
+   * A cheap Codex fleet (e.g. W in [0.05, 0.08]) alongside a busy Anthropic fleet
+   * (e.g. W in [0.11, 0.64]) would manufacture an artificial cross-fleet spread of
+   * 0.64 - 0.05 = 0.59 that would page continuously even when each provider's
+   * individual fleet is completely balanced. The divergence alert condition
+   * (spread >= margin sustained > 2 h with zero rank moves) must evaluate within
+   * provider to monitor genuine unbalanced capacity.
+   *
+   * @param {Array<{ value: number, provenance: string }>} [allW]
+   * @returns {Record<string, number>}
+   */
+  _weeklySpreadByProvider(allW = null) {
+    const W = allW || this._computeAllW();
+    const byProvider = new Map();
+
+    for (let i = 0; i < this.accounts.length; i++) {
+      const acc = this.accounts[i];
+      const provider = providerOf(acc);
+      const wVal = W[i]?.value;
+      if (wVal == null) continue;
+      let list = byProvider.get(provider);
+      if (!list) {
+        list = [];
+        byProvider.set(provider, list);
+      }
+      list.push(wVal);
+    }
+
+    const spreads = {};
+    for (const [provider, values] of byProvider.entries()) {
+      if (values.length === 0) {
+        spreads[provider] = 0;
+      } else {
+        const max = Math.max(...values);
+        const min = Math.min(...values);
+        spreads[provider] = Math.round((max - min) * 1e12) / 1e12;
+      }
+    }
+    return spreads;
+  }
+
+  /**
    * Return a status summary of all accounts (safe to expose, no credentials).
    */
   // `sessionDetail` adds the per-session `sessions.items` array. Off unless the
@@ -3379,6 +3465,7 @@ export class AccountManager {
     // precisely because it trusts the server to have done this (#237).
     this.sweepExpiredQuotas();
     const sessions = this.sessionTracker.stats(undefined, { detail: sessionDetail });
+    const allW = this._computeAllW();
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
       // Where a request no route claims lands right now — the same derivation
@@ -3390,12 +3477,16 @@ export class AccountManager {
       // per-bucket values rather than only the representative number.
       switchThresholds: typeof this.switchThreshold === 'object' && this.switchThreshold
         ? { ...this.switchThreshold } : null,
+      routingStrategy: this.routingStrategy,
+      weeklyBalanceMargin: this.weeklyBalanceMargin,
       // The knob as the server resolved it, defaults and clamps applied, so an
       // operator reading status sees the configuration the router is using.
       expiryRouting: { ...this.expiryRouting },
       routes: this.getRoutes(),
       sessions: { ...sessions, distribute: this.distributeSessions, draining: this.drainingCount() },
-      accounts: this.accounts.map(a => ({
+      marginMove: { ...this.marginMove },
+      spread: this._weeklySpreadByProvider(allW),
+      accounts: this.accounts.map((a, i) => ({
         name: a.name,
         type: a.type,
         orgName: a.orgName || null,
@@ -3411,8 +3502,12 @@ export class AccountManager {
         // Shared-weekly pressure (model-agnostic), so the ordering the router
         // works from can be read off the payload. Computed whether or not the
         // knob is on: a measurement of the fleet, not a report of the feature's
-        // state.
+        // state. Note: this publishes true *expiry* pressure even under balanced
+        // routing (_pressureVariant does not consult strategy). Labeled with
+        // pressureType so a reader cannot mistake it for the ranking actually in use.
         pressure: this._expiryPressure(a),
+        pressureType: 'expiry',
+        W: allW[i] ? { value: allW[i].value, provenance: allW[i].provenance } : null,
         quota: { ...a.quota },
         // `byBucket` is the one nested value under `usage`, so the shallow copy
         // that covers every flat counter beside it would hand the caller a live
