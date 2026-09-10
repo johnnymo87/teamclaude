@@ -177,3 +177,11 @@ test('W is model-independent by construction: _computeAllW takes no arguments an
   // a2 has unified7d = null, so family proxy takes max(0.90, 0.20) = 0.90 (family-proxy), NOT model-dependent
   assert.deepEqual(baseline[1], { value: 0.90, provenance: 'family-proxy' });
 });
+
+test('W computation tolerates W > 1.0 without clamping', () => {
+  const am = new AccountManager([oauth('a')], 0.98, { routingStrategy: 'balanced' });
+  am.accounts[0].quota.unified7dFable = 1.3;
+  const Ws = am._computeAllW();
+  assert.deepEqual(Ws[0], { value: 1.3, provenance: 'family-proxy' });
+});
+
