@@ -262,11 +262,13 @@ export class AccountManager {
     // - blocked_5h: candidate W had >= margin advantage but unified5h >= 0.90.
     // - blocked_paused: candidate W had >= margin advantage but candidate is paused.
     // - below_margin: candidate W was not lower than current W by >= weeklyBalanceMargin.
+    // - self_best: current account already ranks best or no candidate was available.
     this.marginMove = {
       done: 0,
       blocked_5h: 0,
       blocked_paused: 0,
       below_margin: 0,
+      self_best: 0,
     };
 
     // Sessions still being drained after distribution was turned off (see
@@ -887,7 +889,12 @@ export class AccountManager {
       // most once across candidates to keep W frozen within this decision (D4).
       if (this.routingStrategy === 'balanced') {
         allW ??= this._computeAllW();
-        if (this._marginPreemptedBy(pinned, model, advisorModel, exclude, allW)) continue;
+        // Unpin check: pass { count: false } because releasing a pin here falls
+        // through to _pickLeastLoaded (which load-balances on active session counts
+        // rather than necessarily routing to the margin winner) and does not move
+        // the global cursor. Counting in marginMove here would corrupt cursor
+        // observability metrics (D8).
+        if (this._marginPreemptedBy(pinned, model, advisorModel, exclude, allW, { count: false })) continue;
       }
       return pinned;
     }
@@ -1464,24 +1471,18 @@ export class AccountManager {
    * 5. _switchOnSessionReset is disabled under balanced (T3), preventing out-of-band
    *    re-ranking moves on equal W or small W differences that would violate the descent.
    */
-  _marginPreemptedBy(current, model = null, advisorModel = null, exclude = null, allW = null, options = {}) {
+  _marginPreemptedBy(current, model = null, advisorModel = null, exclude = null, allW = null, { count = true } = {}) {
     if (!current || this.routingStrategy !== 'balanced') return null;
 
-    let count = true;
-    let resolvedW = allW;
-    if (options && typeof options === 'object' && 'count' in options) {
-      count = options.count !== false;
-    } else if (resolvedW && !Array.isArray(resolvedW) && typeof resolvedW === 'object' && 'count' in resolvedW) {
-      count = resolvedW.count !== false;
-      resolvedW = null;
-    }
-
     const best = this._pickBestAvailable(exclude, model, advisorModel);
-    if (!best || best.index === current.index) return null;
+    if (!best || best.index === current.index) {
+      if (count) this.marginMove.self_best++;
+      return null;
+    }
 
     if ((best.priority || 0) > (current.priority || 0)) return null;
 
-    const W = resolvedW || this._computeAllW();
+    const W = allW || this._computeAllW();
     const wCurrent = W[current.index]?.value ?? 0;
     const wBest = W[best.index]?.value ?? 0;
     if (wCurrent - wBest < this.weeklyBalanceMargin - MARGIN_FLOAT_EPSILON) {

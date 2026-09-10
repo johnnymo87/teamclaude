@@ -99,6 +99,7 @@ test('marginMove counter increments done on a successful margin preemption move'
     blocked_5h: 0,
     blocked_paused: 0,
     below_margin: 0,
+    self_best: 0,
   });
 
   // Real selection triggers margin preemption move to candidate 1
@@ -112,6 +113,7 @@ test('marginMove counter increments done on a successful margin preemption move'
     blocked_5h: 0,
     blocked_paused: 0,
     below_margin: 0,
+    self_best: 0,
   });
 
   // Also exposed on getStatus()
@@ -120,6 +122,7 @@ test('marginMove counter increments done on a successful margin preemption move'
     blocked_5h: 0,
     blocked_paused: 0,
     below_margin: 0,
+    self_best: 0,
   });
 });
 
@@ -150,6 +153,7 @@ test('marginMove counter increments blocked_5h when best candidate sits at unifi
     blocked_5h: 1,
     blocked_paused: 0,
     below_margin: 0,
+    self_best: 0,
   });
 });
 
@@ -181,6 +185,7 @@ test('marginMove counter increments blocked_paused when best candidate is paused
     blocked_5h: 0,
     blocked_paused: 1,
     below_margin: 0,
+    self_best: 0,
   });
 });
 
@@ -211,12 +216,47 @@ test('marginMove counter increments below_margin when W gap is below weeklyBalan
     blocked_5h: 0,
     blocked_paused: 0,
     below_margin: 1,
+    self_best: 0,
   });
 });
 
 // ---------------------------------------------------------------------------
 // 3. Preview does NOT increment counters (CRITICAL)
 // ---------------------------------------------------------------------------
+
+test('marginMove counter increments self_best when current account is already best', () => {
+  const am = new AccountManager([oauth('curr'), oauth('other')], 0.98, {
+    routingStrategy: 'balanced',
+    weeklyBalanceMargin: 0.10,
+  });
+
+  const now = Date.now();
+  bucket(am, 0, 'unified7d', 0.20, 50, now);
+  bucket(am, 1, 'unified7d', 0.80, 50, now);
+
+  assert.equal(am.currentIndex, 0);
+  assert.deepEqual(am.marginMove, {
+    done: 0,
+    blocked_5h: 0,
+    blocked_paused: 0,
+    below_margin: 0,
+    self_best: 0,
+  });
+
+  // Current account (0) is already best (0.20 < 0.80). Selection stays on current.
+  const picked = am._select(null, OPUS);
+  assert.equal(picked.name, 'curr');
+  assert.equal(am.currentIndex, 0);
+
+  // Exactly 'self_best' incremented
+  assert.deepEqual(am.marginMove, {
+    done: 0,
+    blocked_5h: 0,
+    blocked_paused: 0,
+    below_margin: 0,
+    self_best: 1,
+  });
+});
 
 test('previewRouteIndex calls _marginPreemptedBy with count:false and does NOT increment marginMove counters', () => {
   // Setup fleet where margin preemption would fire
@@ -244,6 +284,7 @@ test('previewRouteIndex calls _marginPreemptedBy with count:false and does NOT i
     blocked_5h: 0,
     blocked_paused: 0,
     below_margin: 0,
+    self_best: 0,
   }, 'previewRouteIndex must not increment any marginMove counter');
 
   // Also test preview with 5h wall:
@@ -256,6 +297,7 @@ test('previewRouteIndex calls _marginPreemptedBy with count:false and does NOT i
     blocked_5h: 0,
     blocked_paused: 0,
     below_margin: 0,
+    self_best: 0,
   }, 'previewRouteIndex with 5h wall must not increment any marginMove counter');
 
   // Also test preview with paused candidate:
@@ -269,6 +311,7 @@ test('previewRouteIndex calls _marginPreemptedBy with count:false and does NOT i
     blocked_5h: 0,
     blocked_paused: 0,
     below_margin: 0,
+    self_best: 0,
   }, 'previewRouteIndex with paused candidate must not increment any marginMove counter');
 
   // Also test preview with gap below margin:
@@ -282,6 +325,7 @@ test('previewRouteIndex calls _marginPreemptedBy with count:false and does NOT i
     blocked_5h: 0,
     blocked_paused: 0,
     below_margin: 0,
+    self_best: 0,
   }, 'previewRouteIndex below margin must not increment any marginMove counter');
 
   // In contrast, real selection SHOULD count:
@@ -290,7 +334,7 @@ test('previewRouteIndex calls _marginPreemptedBy with count:false and does NOT i
   assert.equal(am.marginMove.done, 1, 'real selection must increment marginMove.done');
 });
 
-test('_selectForSession is a real decision and increments marginMove counters', () => {
+test('_selectForSession does not increment marginMove counters (leaves cursor metrics honest)', () => {
   const am = new AccountManager([oauth('pinned'), oauth('candidate')], 0.98, {
     routingStrategy: 'balanced',
     weeklyBalanceMargin: 0.10,
@@ -311,13 +355,23 @@ test('_selectForSession is a real decision and increments marginMove counters', 
     blocked_5h: 0,
     blocked_paused: 0,
     below_margin: 0,
+    self_best: 0,
   });
 
-  // _selectForSession with session 'sess-1' evaluates margin preemption on the pinned account
+  // _selectForSession with session 'sess-1' evaluates margin preemption on the pinned account.
+  // When the pin is released, the session routes via _pickLeastLoaded.
+  // Because destination is chosen by load rather than the margin winner and the global cursor
+  // is not moved, marginMove counters are NOT incremented ({ count: false }), keeping cursor
+  // metrics honest.
   const picked = am._selectForSession('sess-1', null, OPUS);
-  // Margin preemption releases the pin and picks candidate
   assert.equal(picked.name, 'candidate');
-  assert.equal(am.marginMove.done, 1, '_selectForSession must increment marginMove.done when margin move triggers');
+  assert.deepEqual(am.marginMove, {
+    done: 0,
+    blocked_5h: 0,
+    blocked_paused: 0,
+    below_margin: 0,
+    self_best: 0,
+  }, '_selectForSession must not mutate marginMove counters');
 });
 
 // ---------------------------------------------------------------------------
@@ -384,6 +438,7 @@ test("under 'expiry' and 'drain' strategies, fields are present but inert (no co
       blocked_5h: 0,
       blocked_paused: 0,
       below_margin: 0,
+      self_best: 0,
     });
     assert.ok(status.spread);
     assert.deepEqual(status.accounts[0].W, { value: 0.80, provenance: 'unified' });
@@ -399,6 +454,7 @@ test("under 'expiry' and 'drain' strategies, fields are present but inert (no co
       blocked_5h: 0,
       blocked_paused: 0,
       below_margin: 0,
+      self_best: 0,
     }, `marginMove must remain inert under strategy ${strategy}`);
   }
 });
@@ -435,6 +491,7 @@ test('HTTP GET /teamclaude/status exposes routingStrategy, weeklyBalanceMargin, 
       blocked_5h: 0,
       blocked_paused: 0,
       below_margin: 0,
+      self_best: 0,
     });
     assert.equal(data.spread.anthropic, 0.60);
     assert.deepEqual(data.accounts[0].W, { value: 0.85, provenance: 'unified' });

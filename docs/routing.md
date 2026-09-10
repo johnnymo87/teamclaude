@@ -141,9 +141,67 @@ More precisely, a session holds **one pin per weekly quota bucket**, not one ove
 
 With `expiryRouting.preempt` on, a governing-window **rollover** also ends the drain for the session whose account rolled, and it rejoins normal rotation there and then. The drain trades expiring quota for a warm prompt cache, and that trade is priced on the window the account had when the drain started; once that window has gained a full week the account is the one the fleet should be spending last. Nothing else bounds it — a session making requests never idles out — so without this a long-lived session rides a rolled-over account for as long as it keeps talking.
 
-## Expiry-pressure routing
+## Routing strategies
 
-> **The config key `expiryRouting` is provisional.** [#176](https://github.com/KarpelesLab/teamclaude/issues/176) proposes a `routingStrategy` enum for the adjacent drain-concentration problem, and a strategy value such as `"expiry"` is a plausible home for this behaviour. The mechanism below is settled; only its spelling on disk is open, and it will follow whatever shape that discussion settles on.
+The `routingStrategy` config key selects how TeamClaude ranks and rotates accounts across requests:
+
+```json
+"routingStrategy": "expiry"
+```
+
+Three strategies are supported:
+
+- **`"expiry"` (default)** — Prioritizes spending quota that is closest to expiring unspent. Ranks accounts by expiry pressure (headroom divided by time to reset). See [Expiry-pressure routing](#expiry-pressure-routing).
+- **`"balanced"`** — Distributes weekly quota across accounts. Ranks candidate accounts by weekly utilization ascending (lowest-utilized first), and moves the cursor when an available candidate's weekly utilization is lower than current by at least `weeklyBalanceMargin`. See [Balanced routing](#balanced-routing).
+- **`"drain"`** — Inert strategy. Disables dynamic pressure ranking and banding; accounts remain parked on the current account until the switch threshold, falling back to priority and config order.
+
+### Orthogonality of `routingStrategy` and `expiryRouting`
+
+`routingStrategy` and `expiryRouting.enabled` are orthogonal switches, not a precedence hierarchy:
+
+- `routingStrategy` controls the ranking and preemption function (`expiry`, `balanced`, or `drain`).
+- Under `"balanced"`, expiry pressure banding is explicitly **passthrough** (all candidates remain eligible rather than being narrowed by expiry pressure), and expiry-specific rollover preemption and session-quota reset switches are deactivated because the margin already steers traffic toward rolled, low-utilization accounts.
+- The sub-knobs in `expiryRouting` (`tolerance`, `preempt`) apply when `routingStrategy` is `"expiry"`.
+
+## Balanced routing
+
+Under `routingStrategy: "balanced"`, TeamClaude distributes spend across accounts to prevent multi-day utilization skew:
+
+```json
+"routingStrategy": "balanced",
+"weeklyBalanceMargin": 0.10
+```
+
+### Scope and trade-offs
+
+Balanced routing fixes **weekly distribution** across multiple accounts.
+
+**It does NOT fix the 5-hour session quota wall.** Total 5-hour capacity across the fleet is policy-independent; if aggregate demand exceeds fleet capacity, accounts will still exhaust their 5-hour windows. Furthermore, balanced routing rotates across accounts more frequently than single-account drain, and each rotation incurs a prompt-cache miss and re-write turn on the new account. Consequently, balanced routing plausibly makes intraday 5-hour performance slightly worse in exchange for more even weekly distribution. That trade-off is unmeasured.
+
+### How balanced ranking and margin preemption work
+
+1. **Model-dependent ranking:** When selecting which account serves a request, candidate accounts are ranked by `_governingWindow(account, model).utilization` ascending (lowest-utilized first). A model with its own weekly bucket (such as Fable or Sonnet) ranks accounts based on that model's bucket.
+2. **Model-independent margin preemption:** To prevent flapping between accounts with opposing model utilization (e.g. account A low on Sonnet but high on Fable, and account B vice versa), cursor movement is gated by a model-independent weekly utilization scalar `W` computed across each provider's accounts (`unified7d` -> max of family buckets -> fleet median).
+3. **Margin threshold (`weeklyBalanceMargin`):** Selection moves the cursor to the best available candidate only when `W(current) - W(best) >= weeklyBalanceMargin`. Default is `0.10`.
+   - **Floor clamp (`>= 0.02`):** `weeklyBalanceMargin` is clamped to at least `0.02`, and values below `0.05` log a startup warning. Upstream quota updates arrive in 0.01 quanta. An un-clamped margin (such as 0 or 0.01) would move the cursor on a 1% differential, causing constant rotation and prompt-cache thrashing. Clamping strictly above zero guarantees cycle-freedom and bounds rotation churn.
+4. **Spill guards:** Margin preemption will not move the cursor if the candidate account's 5-hour session bucket sits at `unified5h >= 0.90` (preserving headroom for high-demand bursts) or if the candidate is paused.
+
+### Observability on `/status`
+
+Under balanced routing, `teamclaude status --json` (and `GET /teamclaude/status`) exposes:
+
+- **`routingStrategy`** — the active strategy (`"balanced"`, `"expiry"`, or `"drain"`).
+- **`weeklyBalanceMargin`** — the effective clamped balance margin.
+- **`accounts[].W`** — each account's model-independent weekly balance metric `{ value, provenance }` (`provenance`: `'unified'`, `'family-proxy'`, `'median'`, or `'empty'`).
+- **`spread`** — per-provider `max(W) - min(W)` utilization spread, designed for alerting (e.g. spread >= margin sustained for > 2 hours with zero moves).
+- **`marginMove`** — counters tracking the outcomes of margin preemption evaluations:
+  - `done`: margin preemption successfully rotated the cursor to a lower-W candidate.
+  - `blocked_5h`: candidate had >= margin advantage but was blocked because `unified5h >= 0.90`.
+  - `blocked_paused`: candidate had >= margin advantage but is paused.
+  - `below_margin`: best candidate's W was not lower than current W by at least `weeklyBalanceMargin`.
+  - `self_best`: current account already ranks best (or no candidate available) in steady state.
+
+## Expiry-pressure routing
 
 The soonest-reset preference in [Choosing an account](#choosing-an-account) only applies at the moments selection *has* to pick — daemon start and threshold rotation. On a fleet whose weekly utilization never reaches the threshold, those moments never come: routing can sit on the account whose window just reset a full week out while another account's ample weekly quota quietly expires unspent. Enable `expiryRouting` to make the horizon a standing preference instead:
 
