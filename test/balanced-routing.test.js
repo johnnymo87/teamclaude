@@ -792,3 +792,142 @@ test('expiry and drain strategies are unaffected: _marginPreemptedBy returns nul
   }
 });
 
+// ---------------------------------------------------------------------------
+// Task A (D7): Mirror margin preemption at previewRouteIndex and _selectForSession
+// ---------------------------------------------------------------------------
+
+test('previewRouteIndex agrees with actual selection under balanced margin preemption and does not mutate', () => {
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98, {
+    routingStrategy: 'balanced',
+    weeklyBalanceMargin: 0.10,
+  });
+  am.currentIndex = 0;
+  bucket(am, 0, 'unified7d', 0.80, 50);
+  bucket(am, 1, 'unified7d', 0.20, 50);
+
+  // Read-only verification before preview
+  assert.equal(am.currentIndex, 0);
+  assert.equal(am._currentObs, null);
+
+  // 1. With W gap >= margin, previewRouteIndex reports the margin winner (b, index 1)
+  // and NOT the current account (a, index 0).
+  const previewIdx = am.previewRouteIndex(OPUS);
+  assert.equal(previewIdx, 1, 'previewRouteIndex must report margin winner (b, index 1), not current (a, index 0)');
+
+  // 2. previewRouteIndex is read-only and mutates nothing
+  assert.equal(am.currentIndex, 0, 'previewRouteIndex must not mutate currentIndex');
+  assert.equal(am._currentObs, null, 'previewRouteIndex must not seed _currentObs');
+  assert.equal(am.accounts[1].ramping, undefined, 'previewRouteIndex must not begin ramp');
+
+  // 3. previewRouteIndex answer equals what actual selection does (they must agree)
+  const actual = am.getActiveAccount(null, OPUS);
+  assert.equal(actual.index, previewIdx, 'previewRouteIndex answer must agree with actual selection');
+  assert.equal(actual.name, 'b');
+  assert.equal(am.currentIndex, 1, 'actual selection updates currentIndex to margin winner');
+
+  // 4. Subcase: with W gap < margin, previewRouteIndex stays on current account
+  const amSmall = new AccountManager([oauth('a'), oauth('b')], 0.98, {
+    routingStrategy: 'balanced',
+    weeklyBalanceMargin: 0.10,
+  });
+  amSmall.currentIndex = 0;
+  bucket(amSmall, 0, 'unified7d', 0.25, 50);
+  bucket(amSmall, 1, 'unified7d', 0.20, 50); // gap = 0.05 < 0.10
+  const previewSmall = amSmall.previewRouteIndex(OPUS);
+  assert.equal(previewSmall, 0, 'previewRouteIndex stays on current account when gap < margin');
+  const actualSmall = amSmall.getActiveAccount(null, OPUS);
+  assert.equal(actualSmall.index, previewSmall, 'previewRouteIndex and actual selection must agree when gap < margin');
+  assert.equal(actualSmall.name, 'a');
+});
+
+test('session pin re-routes under balanced when behind margin, stays pinned below margin', () => {
+  // Case 1: W gap >= margin -> session pin re-routes
+  const amReRoute = new AccountManager([oauth('a'), oauth('b')], 0.98, {
+    routingStrategy: 'balanced',
+    weeklyBalanceMargin: 0.10,
+    distributeSessions: true,
+  });
+  bucket(amReRoute, 0, 'unified7d', 0.80, 50);
+  bucket(amReRoute, 1, 'unified7d', 0.20, 50);
+  amReRoute.recordSession('s1', 0, OPUS); // pinned to account a (index 0)
+  assert.equal(amReRoute.sessionTracker.pinnedAccount('s1', 'unified7d'), 0);
+
+  const selectedReRoute = amReRoute.getActiveAccount(null, OPUS, null, 's1');
+  assert.equal(
+    selectedReRoute.name,
+    'b',
+    'session pinned to account behind margin must re-route to margin winner',
+  );
+
+  // Case 2: W gap < margin -> stays pinned
+  const amStay = new AccountManager([oauth('a'), oauth('b')], 0.98, {
+    routingStrategy: 'balanced',
+    weeklyBalanceMargin: 0.10,
+    distributeSessions: true,
+  });
+  bucket(amStay, 0, 'unified7d', 0.25, 50);
+  bucket(amStay, 1, 'unified7d', 0.20, 50); // gap 0.05 < 0.10
+  amStay.recordSession('s2', 0, OPUS); // pinned to account a (index 0)
+  assert.equal(amStay.sessionTracker.pinnedAccount('s2', 'unified7d'), 0);
+
+  const selectedStay = amStay.getActiveAccount(null, OPUS, null, 's2');
+  assert.equal(
+    selectedStay.name,
+    'a',
+    'session pinned to account within margin must stay pinned',
+  );
+
+  // Case 3: W frozen across multiple candidate checks in _selectForSession
+  const amMulti = new AccountManager([oauth('a'), oauth('b'), oauth('c')], 0.98, {
+    routingStrategy: 'balanced',
+    weeklyBalanceMargin: 0.10,
+    distributeSessions: true,
+  });
+  bucket(amMulti, 0, 'unified7d', 0.80, 50);
+  bucket(amMulti, 1, 'unified7d', 0.80, 50);
+  bucket(amMulti, 2, 'unified7d', 0.10, 50);
+  amMulti.recordSession('s3', 0, OPUS);
+  amMulti.recordSession('s3', 1, FABLE);
+
+  let computeCount = 0;
+  const origComputeAllW = amMulti._computeAllW.bind(amMulti);
+  amMulti._computeAllW = () => {
+    computeCount++;
+    return origComputeAllW();
+  };
+
+  const selectedMulti = amMulti.getActiveAccount(null, OPUS, null, 's3');
+  assert.equal(selectedMulti.name, 'c');
+  assert.equal(
+    computeCount,
+    1,
+    '_computeAllW must be called at most once across multiple candidates in _selectForSession',
+  );
+});
+
+test('previewRouteIndex and session pin preemption behave identically under expiry and drain strategies', () => {
+  for (const strategy of ['expiry', 'drain']) {
+    const am = new AccountManager([oauth('a'), oauth('b')], 0.98, {
+      routingStrategy: strategy,
+      weeklyBalanceMargin: 0.10,
+      distributeSessions: true,
+      expiryRouting: { enabled: strategy === 'expiry', preempt: strategy === 'expiry' },
+    });
+    am.currentIndex = 0;
+    // Set large W gap that WOULD trigger balanced margin preemption
+    bucket(am, 0, 'unified7d', 0.90, 50);
+    bucket(am, 1, 'unified7d', 0.10, 50);
+
+    // 1. previewRouteIndex ignores W gap under non-balanced strategies
+    const preview = am.previewRouteIndex(OPUS);
+    assert.equal(preview, 0, `previewRouteIndex must stay on current account under ${strategy} strategy`);
+    assert.equal(am.currentIndex, 0);
+
+    // 2. session pin ignores W gap under non-balanced strategies
+    am.recordSession('s1', 0, OPUS);
+    const selectedSession = am.getActiveAccount(null, OPUS, null, 's1');
+    assert.equal(selectedSession.name, 'a', `session pin must remain on account a under ${strategy} strategy`);
+  }
+});
+
+
