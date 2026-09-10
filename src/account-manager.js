@@ -752,6 +752,13 @@ export class AccountManager {
       }
       const betterExists = this._preemptedBy(current, model, advisorModel, exclude);
       if (betterExists) return this._selectNext(exclude, model, advisorModel);
+      // Margin preemption (balanced routing): rotate away from current when an
+      // available candidate has lower weekly utilization W by at least weeklyBalanceMargin.
+      // Checked after priority preemption because operator priority is explicit intent
+      // that beats the margin. Routed through _selectNext -> _setCurrent so the
+      // rollover baseline is seeded via _firstSightOn (design D5).
+      const marginWinner = this._marginPreemptedBy(current, model, advisorModel, exclude);
+      if (marginWinner) return this._selectNext(exclude, model, advisorModel);
       return current;
     }
     // Barred for this request only: keep the family where it was diverted.
@@ -1362,6 +1369,56 @@ export class AccountManager {
     return this.accounts.find(a => this._isAvailable(a, model, advisorModel)
       && !exclude?.has(a.index)
       && (a.priority || 0) < (account.priority || 0)) || null;
+  }
+
+  /**
+   * The available account that would preempt `current` under the balanced
+   * margin rule, or null. Active only when routingStrategy is 'balanced'.
+   *
+   * Moves the cursor to the best available candidate when that candidate's
+   * weekly utilization W is lower than current's by at least weeklyBalanceMargin,
+   * subject to priority bounds and two spill guards (target 5h < 0.90, not paused).
+   * Priority preemption is checked before this in _select because operator
+   * priority is explicit intent that beats the margin.
+   *
+   * Cycle-freedom proof (adapted from balanced/src/account-manager.js:443-447):
+   * In any cycle the total priority change is zero. Preemption edges strictly
+   * decrease priority; margin edges never increase it. Therefore every edge
+   * in a cycle must be a same-priority margin move. Each such move descends W
+   * by at least the margin, so the cycle's total W change is strictly negative
+   * — a contradiction. Hence no cycle.
+   *
+   * Preconditions for the proof to hold (design D4 [R1]):
+   * 1. weeklyBalanceMargin >= 0.02 > 0 strictly (clamps prevent 0, which would
+   *    admit A->B->A flapping).
+   * 2. W is frozen within a decision: computed once via _computeAllW() and threaded
+   *    via `allW` rather than recomputed per comparison.
+   * 3. W is model-independent (provider-partitioned weekly metric, not model-dependent).
+   * 4. Priority terms stay `<` for preemption and `<=` for margin moves — an account
+   *    with strictly lower priority (higher numerical value) is never taken on the margin.
+   * 5. _switchOnSessionReset is disabled under balanced (T3), preventing out-of-band
+   *    re-ranking moves on equal W or small W differences that would violate the descent.
+   */
+  _marginPreemptedBy(current, model = null, advisorModel = null, exclude = null, allW = null) {
+    if (!current || this.routingStrategy !== 'balanced') return null;
+
+    const best = this._pickBestAvailable(exclude, model, advisorModel);
+    if (!best || best.index === current.index) return null;
+
+    if ((best.priority || 0) > (current.priority || 0)) return null;
+
+    const W = allW || this._computeAllW();
+    const wCurrent = W[current.index]?.value ?? 0;
+    const wBest = W[best.index]?.value ?? 0;
+    if (wCurrent - wBest < this.weeklyBalanceMargin) return null;
+
+    const unified5hOk = best.quota?.unified5h == null || best.quota.unified5h < 0.90;
+    if (!unified5hOk) return null;
+
+    const notPaused = !best.pausedUntil || Date.now() >= best.pausedUntil;
+    if (!notPaused) return null;
+
+    return best;
   }
 
   /**
