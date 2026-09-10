@@ -845,9 +845,7 @@ test('_setCurrent is used on margin move: first-sight observation is seeded', ()
 });
 
 test('W evaluation bound: a selection decision evaluates W a bounded number of times', () => {
-  // A direct _select decision evaluates _computeAllW at most once across all candidates.
-  // Note: if session distribution is active and falls through to placement (_pickLeastLoaded),
-  // _belowBandFloor legitimately computes W a second time with the identical snapshot value.
+  // A direct _select decision evaluates _computeAllW exactly once across all candidates.
   const am = new AccountManager([oauth('a'), oauth('b'), oauth('c'), oauth('d')], 0.98, {
     routingStrategy: 'balanced',
     weeklyBalanceMargin: 0.10,
@@ -874,25 +872,17 @@ test('W evaluation bound: a selection decision evaluates W a bounded number of t
     'direct selection decision evaluates W exactly once',
   );
 
-  // When session placement routes through _pickLeastLoaded, _belowBandFloor computes W again:
+  // Precomputed allW passed to _marginPreemptedBy results in zero recomputes
+  // (design D4 precondition 2, "W frozen within a decision"):
   computeCount = 0;
-  const amSession = new AccountManager([oauth('a'), oauth('b')], 0.98, {
-    routingStrategy: 'balanced',
-    weeklyBalanceMargin: 0.10,
-    distributeSessions: true,
-  });
-  bucket(amSession, 0, 'unified7d', 0.50, 50);
-  bucket(amSession, 1, 'unified7d', 0.20, 50);
-  amSession._computeAllW = () => {
-    computeCount++;
-    return origComputeAllW();
-  };
-  amSession.beginSession('new-sess');
-  amSession.getActiveAccount(null, OPUS, null, 'new-sess');
-  amSession.endSession('new-sess');
-  assert.ok(
-    computeCount <= 2,
-    `session placement decision evaluates W at most twice (got ${computeCount})`,
+  const precomputedW = origComputeAllW();
+  am.currentIndex = 0;
+  const result = am._marginPreemptedBy(am.accounts[0], null, null, null, precomputedW);
+  assert.equal(result?.name, 'd');
+  assert.equal(
+    computeCount,
+    0,
+    '_computeAllW must not be called when precomputed allW is provided',
   );
 });
 
@@ -1456,15 +1446,28 @@ test('W > 1.0 is not clamped end-to-end: flows through family-proxy, median, mar
   assert.deepEqual(Ws[1], { value: 1.125, provenance: 'median' });
   assert.deepEqual(Ws[2], { value: 0.95, provenance: 'unified' });
 
-  // 2. Also check fleet of two [a, b] where median is exactly 1.3
-  const amTwo = new AccountManager([oauth('a'), oauth('b')], 0.98, {
+  // 2. Also check fleet where unprobed account has median exactly 1.3:
+  // Fleet [a, b, c, d]: a (1.3), b (1.3), c (unprobed -> median 1.3), d (0.95)
+  const amExact = new AccountManager([oauth('a'), oauth('b'), oauth('c'), oauth('d')], 0.98, {
     routingStrategy: 'balanced',
     weeklyBalanceMargin: 0.10,
   });
-  amTwo.accounts[0].quota.unified7dFable = 1.3;
-  const WsTwo = amTwo._computeAllW();
-  assert.deepEqual(WsTwo[0], { value: 1.3, provenance: 'family-proxy' });
-  assert.deepEqual(WsTwo[1], { value: 1.3, provenance: 'median' });
+  amExact.accounts[0].quota.unified7dFable = 1.3;
+  amExact.accounts[0].quota.unified7dReset = now + 100 * H;
+  amExact.accounts[0].probing = false;
+  amExact.accounts[1].quota.unified7d = 1.3;
+  amExact.accounts[1].quota.unified7dReset = now + 100 * H;
+  amExact.accounts[1].probing = false;
+  amExact.accounts[2].quota.unified7d = null; // unprobed -> median of [0.95, 1.3, 1.3] is 1.3
+  amExact.accounts[2].quota.unified7dReset = now + 100 * H;
+  amExact.accounts[2].probing = false;
+  bucket(amExact, 3, 'unified7d', 0.95, 50, now);
+
+  const WsExact = amExact._computeAllW();
+  assert.deepEqual(WsExact[0], { value: 1.3, provenance: 'family-proxy' });
+  assert.deepEqual(WsExact[1], { value: 1.3, provenance: 'unified' });
+  assert.deepEqual(WsExact[2], { value: 1.3, provenance: 'median' });
+  assert.deepEqual(WsExact[3], { value: 0.95, provenance: 'unified' });
 
   // 3. _marginPreemptedBy: unclamped W diff is 1.3 - 0.95 = 0.35 >= 0.10 -> preempts to c.
   // If W were clamped to 1.0, 1.0 - 0.95 = 0.05 < 0.10 and preemption would NOT fire.
@@ -1488,12 +1491,20 @@ test('W > 1.0 is not clamped end-to-end: flows through family-proxy, median, mar
   const heldOffMedian = am._belowBandFloor([am.accounts[1], am.accounts[2]], OPUS, now);
   assert.deepEqual(heldOffMedian, [1, 0], 'candidate with median W = 1.125 is held off against W = 0.95');
 
-  // For two-account fleet [a, b] with candidate c: b has median 1.3
-  const heldOffExactMedian = amTwo._belowBandFloor([amTwo.accounts[1], am.accounts[2]], OPUS, now);
-  assert.deepEqual(heldOffExactMedian, [1, 0], 'candidate with median W = 1.3 is held off against W = 0.95');
+  // For fleet with candidate c having exact median W = 1.3:
+  // Both candidates belong to the same manager amExact
+  const heldOffExactMedian = amExact._belowBandFloor([amExact.accounts[2], amExact.accounts[3]], OPUS, now);
+  assert.deepEqual(heldOffExactMedian, [1, 0], 'candidate with median W = 1.3 is held off against W = 0.95 on same manager');
 });
 
-test('advisor pass never mutates under balanced routing: does not move cursor, seed observations, or increment marginMove counters', () => {
+test('advisor pass does not mutate when the current account is barred', () => {
+  // Note: The advisor pass (_select(..., advisorModel, false)) is NOT read-only in general.
+  // When the current account IS available for both request and advisor models, but another
+  // candidate satisfies the balance margin, _select moves currentIndex and increments
+  // marginMove.done: 1 by design.
+  // The pass only avoids mutation when the current account cannot serve (it either
+  // degrades or routes off-pointer without moving currentIndex).
+  //
   // Case 1: An advisor request degrades to executor-only when no account can serve the advisor model.
   // Neither account can serve Fable. Account a has lower W (0.20) than b (0.25), diff < margin.
   {
