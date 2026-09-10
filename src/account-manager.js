@@ -1604,8 +1604,49 @@ export class AccountManager {
    * `candidates`. With the knob off the term is absent for every account, so it
    * is inert rather than special-cased: the disabled path is the plain term
    * order and not a branch someone has to keep correct.
+   *
+   * Strategy dispatch:
+   * - 'expiry': headroom per second until window resets, sorted ascending
+   *   (higher pressure = more negative rank). Inert when expiryRouting.enabled is off.
+   * - 'drain': inert path across the fleet, regardless of expiryRouting.enabled.
+   * - 'balanced': raw governing window utilization, ascending (lower utilization
+   *   sorts first). An account with unknown (null) or non-finite utilization
+   *   ranks at the median of known candidate utilizations (design D3) so it is
+   *   neither preferentially drained nor completely starved. If no candidate has
+   *   a known utilization, all candidates receive constant 0 so the term is inert.
+   *   Under balanced, this must NEVER return -Infinity.
+   *
+   * NOTE: This median is over model-scoped candidate utilizations. It is a
+   * DIFFERENT median from the one _computeAllW computes in task T4
+   * (model-independent, per-provider, over the whole fleet). Do not unify
+   * them: ranking needs model-scoped window utilization to preserve family
+   * quota, whereas margin moves evaluate fleet-wide provider balance.
    */
   _rankedPressures(candidates, model, now) {
+    if (this.routingStrategy === 'drain') {
+      return candidates.map(() => pressureRank({ kind: 'absent', reason: 'expiry-routing-off' }));
+    }
+    if (this.routingStrategy === 'balanced') {
+      const known = [];
+      for (const a of candidates) {
+        const u = this._governingWindow(a, model).utilization;
+        if (typeof u === 'number' && Number.isFinite(u)) {
+          known.push(u);
+        }
+      }
+      let fallbackMedian = 0;
+      if (known.length > 0) {
+        const sorted = [...known].sort((a, b) => a - b);
+        const mid = Math.floor(sorted.length / 2);
+        fallbackMedian = sorted.length % 2 === 1
+          ? sorted[mid]
+          : (sorted[mid - 1] + sorted[mid]) / 2;
+      }
+      return candidates.map(a => {
+        const u = this._governingWindow(a, model).utilization;
+        return (typeof u === 'number' && Number.isFinite(u)) ? u : fallbackMedian;
+      });
+    }
     if (!this.expiryRouting.enabled) {
       return candidates.map(() => pressureRank({ kind: 'absent', reason: 'expiry-routing-off' }));
     }
@@ -1622,7 +1663,9 @@ export class AccountManager {
    * discoverable, and an account with no reading at all is never held off.
    */
   _belowBandFloor(candidates, model, now) {
-    if (!this.expiryRouting.enabled) return candidates.map(() => 0);
+    // The band floor is an expiry-pressure concept. Non-expiry strategies
+    // return all-zeros (nothing held off); task T7 introduces balanced heldOff.
+    if (this.routingStrategy !== 'expiry' || !this.expiryRouting.enabled) return candidates.map(() => 0);
     const snapshot = this._bandSnapshot(candidates, model, now);
     const decision = decideBand(snapshot);
     const bounds = snapshot.accounts.map(a => {
@@ -1662,6 +1705,12 @@ export class AccountManager {
    * known here", never "resets at the epoch".
    */
   _rankingReset(account, model) {
+    // Under balanced, rank and tiebreak must read the SAME window pair;
+    // otherwise balanced would rank on a possibly-scoped bucket's utilization
+    // while tie-breaking on the named bucket's reset (two different clocks).
+    if (this.routingStrategy === 'balanced') {
+      return this._governingWindow(account, model).resetAt ?? null;
+    }
     if (!this.expiryRouting.enabled) return this._governingWeeklyReset(account, model);
     return this._governingWindow(account, model).resetAt ?? null;
   }
@@ -1708,7 +1757,11 @@ export class AccountManager {
   _bandSnapshot(candidates, model, now) {
     return {
       now,
-      enabled: !!this.expiryRouting.enabled,
+      // Banding is an expiry-pressure mechanism (decideBand calls pressureOf
+      // internally). Under 'balanced' and 'drain', banding is disabled and
+      // candidate sets pass through intact; otherwise balanced would merely
+      // reorder within an expiry-chosen band (the R1 blocker).
+      enabled: this.routingStrategy === 'expiry' && !!this.expiryRouting.enabled,
       tolerance: this.expiryRouting.tolerance,
       accounts: candidates.map(a => {
         const { utilization: used, resetAt: reset } = this._governingWindow(a, model);
