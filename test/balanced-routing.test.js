@@ -615,6 +615,48 @@ test('margin preemption: fires when W(current) - W(best) >= margin, does NOT fir
   assert.equal(am.currentIndex, 1);
 });
 
+test('margin preemption threads preselected winner into _selectNext to preserve D4 precondition 4', () => {
+  const am = new AccountManager([oauth('a'), oauth('b'), oauth('c')], 0.98, {
+    routingStrategy: 'balanced',
+    weeklyBalanceMargin: 0.10,
+  });
+  const [, , c] = am.accounts;
+  am.currentIndex = 0; // a is current
+  bucket(am, 0, 'unified7d', 0.50, 50);
+  bucket(am, 1, 'unified7d', 0.20, 50);
+  bucket(am, 2, 'unified7d', 0.05, 50);
+
+  // c is currently throttled / unavailable
+  c.status = 'throttled';
+  c.rateLimitedUntil = Date.now() + 60_000;
+  c.throttledAt = Date.now();
+
+  // Intercept _pickBestAvailable so after the first call (from _marginPreemptedBy),
+  // c becomes available. Without preselected threaded through, _selectNext's
+  // un-threaded call would recompute _pickBestAvailable and pick c rather than
+  // b (the margin-tested winner).
+  let callCount = 0;
+  const origPick = am._pickBestAvailable.bind(am);
+  am._pickBestAvailable = (...args) => {
+    callCount++;
+    const res = origPick(...args);
+    if (callCount === 1) {
+      // First call was from _marginPreemptedBy: now make c available
+      c.status = 'ok';
+      c.rateLimitedUntil = null;
+    }
+    return res;
+  };
+
+  const selected = am.getActiveAccount(null, OPUS);
+  assert.equal(
+    selected.name,
+    'b',
+    'selection MUST switch to b (the margin-tested winner), not c (which became available afterwards)',
+  );
+  assert.equal(am.currentIndex, 1, 'currentIndex must be account b');
+});
+
 test('spill guards: unified5h >= 0.90 and pausedUntil in future independently block margin move; cleared guards allow it', () => {
   const am = new AccountManager([oauth('a'), oauth('b')], 0.98, {
     routingStrategy: 'balanced',
