@@ -795,8 +795,11 @@ export class AccountManager {
       // Checked after priority preemption because operator priority is explicit intent
       // that beats the margin. Routed through _selectNext -> _setCurrent so the
       // rollover baseline is seeded via _firstSightOn (design D5).
+      // Thread marginWinner through to _selectNext as preselected (D4 precondition 4):
+      // recomputing _pickBestAvailable inside _selectNext could pick a newly-available
+      // candidate (e.g. throttle expiring between calls) with an untested W gap.
       const marginWinner = this._marginPreemptedBy(current, model, advisorModel, exclude);
-      if (marginWinner) return this._selectNext(exclude, model, advisorModel);
+      if (marginWinner) return this._selectNext(exclude, model, advisorModel, marginWinner);
       return current;
     }
     // Barred for this request only: keep the family where it was diverted.
@@ -2798,8 +2801,12 @@ export class AccountManager {
     return best;
   }
 
-  _selectNext(exclude = null, model = null, advisorModel = null) {
-    const best = this._pickBestAvailable(exclude, model, advisorModel);
+  _selectNext(exclude = null, model = null, advisorModel = null, preselected = null) {
+    // When a caller has already tested and selected a candidate (such as margin
+    // preemption in _select), preselected is accepted directly so an intervening
+    // state change (e.g. throttle expiring between preemption check and cursor move)
+    // cannot divert the cursor onto an account with an untested W gap (D4 precondition 4).
+    const best = preselected ?? this._pickBestAvailable(exclude, model, advisorModel);
     if (best) {
       const previous = this._previousCursor(model, advisorModel);
       const switched = previous != null && previous !== best.index;
