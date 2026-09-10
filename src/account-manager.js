@@ -1092,6 +1092,99 @@ export class AccountManager {
     return q[`${key}Reset`] || this._scopedWeekly(account, model)?.resetAt || q.unified7dReset || null;
   }
 
+  /**
+   * Compute model-INDEPENDENT weekly utilization scalar W for ALL accounts at once,
+   * partitioned per provider.
+   *
+   * W is model-INDEPENDENT by construction: it takes no `model` argument and must
+   * never consult one. The cycle-freedom proof depends on this (design D4 item 3):
+   * if W varied across models within a decision, margin comparisons between
+   * requests could cycle across model switches.
+   *
+   * Why per-provider (design "Open questions — RESOLVED" Q1): every W comparison
+   * is already intra-provider (getActiveAccount borrows the cursor per provider;
+   * _excludeOtherProviders strips foreign accounts), so partitioning costs
+   * nothing. A fleet-wide median would let one provider's numbers manufacture a
+   * cursor move in another's: e.g. an Anthropic fleet at {0.64, 0.43, 0.39, 0.11}
+   * plus two cheap Codex accounts at {0.05, 0.08} gives a fleet median ~0.25,
+   * which an unprobed Anthropic account inherits, becoming best; the cursor moves
+   * onto it, it probes at 0.95, and the cursor moves straight back — two prompt-
+   * cache storms manufactured by another provider's numbers.
+   *
+   * Why 0 / 'empty' is safe as the per-provider floor even though W=0 reads as
+   * "completely unspent" and would normally be maximally attractive: if a group
+   * has nothing resolved, every member gets the same constant, so all
+   * within-group W differences are 0 and no margin move can fire. "Maximally
+   * attractive" only bites against known values, which by construction do not
+   * exist in that group.
+   *
+   * Algorithm, applied independently within each provider group:
+   * Pass 1:
+   *   - quota.unified7d != null -> { value: quota.unified7d, provenance: 'unified' }
+   *   - else if any of unified7dFable / unified7dSonnet is non-null ->
+   *       { value: max(those present), provenance: 'family-proxy' }
+   *   - else unresolved.
+   * Pass 2:
+   *   - unresolved accounts in that group get { value: median(group pass-1 resolved), provenance: 'median' }.
+   *   - if that group has NO pass-1 resolved accounts, every account gets { value: 0, provenance: 'empty' }.
+   * Median convention: sort ascending; odd count -> middle element; even count -> mean of two middle elements.
+   *
+   * @returns {Array<{ value: number, provenance: 'unified' | 'family-proxy' | 'median' | 'empty' }>}
+   */
+  _computeAllW() {
+    const results = new Array(this.accounts.length);
+    const byProvider = new Map();
+
+    for (let i = 0; i < this.accounts.length; i++) {
+      const acc = this.accounts[i];
+      const provider = providerOf(acc);
+      let group = byProvider.get(provider);
+      if (!group) {
+        group = { unresolvedIndices: [], pass1Resolved: [] };
+        byProvider.set(provider, group);
+      }
+
+      const q = acc.quota || {};
+      if (q.unified7d != null) {
+        const res = { value: q.unified7d, provenance: 'unified' };
+        results[i] = res;
+        group.pass1Resolved.push(res.value);
+      } else {
+        const familyVals = [];
+        if (q.unified7dFable != null) familyVals.push(q.unified7dFable);
+        if (q.unified7dSonnet != null) familyVals.push(q.unified7dSonnet);
+        if (familyVals.length > 0) {
+          const res = { value: Math.max(...familyVals), provenance: 'family-proxy' };
+          results[i] = res;
+          group.pass1Resolved.push(res.value);
+        } else {
+          results[i] = null;
+          group.unresolvedIndices.push(i);
+        }
+      }
+    }
+
+    for (const group of byProvider.values()) {
+      if (group.pass1Resolved.length > 0) {
+        const sorted = [...group.pass1Resolved].sort((a, b) => a - b);
+        const mid = Math.floor(sorted.length / 2);
+        const medianVal = (sorted.length % 2 === 1)
+          ? sorted[mid]
+          : (sorted[mid - 1] + sorted[mid]) / 2;
+
+        for (const idx of group.unresolvedIndices) {
+          results[idx] = { value: medianVal, provenance: 'median' };
+        }
+      } else {
+        for (const idx of group.unresolvedIndices) {
+          results[idx] = { value: 0, provenance: 'empty' };
+        }
+      }
+    }
+
+    return results;
+  }
+
   /** True when the family-specific weekly bucket that governs `model` is spent.
    * Unlike _isNearQuota this ignores the shared 5h/weekly caps. Two call sites:
    * the probe filter in _selectProbe, which skips an account for a probe of a
