@@ -1621,7 +1621,10 @@ export class AccountManager {
       // for a warm cache priced on the window the account had when it started
       // and is otherwise unbounded: an active session renews its own idle
       // window. Breaking hands the session to the ordinary walk, which aims.
-      if (this.expiryRouting.enabled && this.expiryRouting.preempt
+      // Gated on strategy === 'expiry': under balanced, margin preemption already
+      // pulls traffic toward rolled accounts and rollover preemption does not belong.
+      // Otherwise a draining session under balanced loses its warm cache on roll.
+      if (this.routingStrategy === 'expiry' && this.expiryRouting.enabled && this.expiryRouting.preempt
           && this._pinRolledOver(sessionId, pinned, model)) break;
       // Mirror _select's priority preemption, as _selectForSession does.
       const betterExists = this.accounts.some(a =>
