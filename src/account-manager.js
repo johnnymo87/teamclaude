@@ -1534,6 +1534,14 @@ export class AccountManager {
     if (preemptor) {
       return { eligible: false, reason: `outranked by higher-priority account "${preemptor.name}"` };
     }
+    // Under balanced routing, an account outranked on weekly balance by >= weeklyBalanceMargin
+    // is rotated off by selection on the very next request (see _marginPreemptedBy).
+    // Phrased to read correctly after "<name> is ...", e.g. "outranked on weekly balance by ...".
+    // Pass { count: false } so this read-only query does not mutate marginMove counters.
+    const marginPreemptor = this._marginPreemptedBy(account, null, null, null, null, { count: false });
+    if (marginPreemptor) {
+      return { eligible: false, reason: `outranked on weekly balance by "${marginPreemptor.name}"` };
+    }
     return { eligible: true };
   }
 

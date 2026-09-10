@@ -657,6 +657,46 @@ test('margin preemption threads preselected winner into _selectNext to preserve 
   assert.equal(am.currentIndex, 1, 'currentIndex must be account b');
 });
 
+test('eligibility() under balanced routing reports ineligibility when outranked on weekly balance', () => {
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98, {
+    routingStrategy: 'balanced',
+    weeklyBalanceMargin: 0.10,
+  });
+  am.currentIndex = 0;
+  bucket(am, 0, 'unified7d', 0.50, 50);
+  bucket(am, 1, 'unified7d', 0.20, 50);
+
+  const initialCounters = { ...am.marginMove };
+
+  // 1. Account a has W 0.50, b has W 0.20 (diff 0.30 >= margin 0.10) -> ineligible
+  const resA = am.eligibility(0);
+  assert.equal(resA.eligible, false);
+  assert.equal(resA.reason, 'outranked on weekly balance by "b"');
+
+  // Must not touch marginMove counters ({ count: false })
+  assert.deepEqual(am.marginMove, initialCounters, 'eligibility query must not increment marginMove counters');
+
+  // 2. Account b is best -> eligible
+  const resB = am.eligibility(1);
+  assert.equal(resB.eligible, true);
+  assert.deepEqual(am.marginMove, initialCounters);
+
+  // 3. Below margin: W diff 0.05 < margin 0.10 -> both eligible
+  bucket(am, 0, 'unified7d', 0.25, 50);
+  const resBelow = am.eligibility(0);
+  assert.equal(resBelow.eligible, true);
+  assert.deepEqual(am.marginMove, initialCounters);
+
+  // 4. Under expiry strategy: margin is not consulted, so a is eligible
+  const amExpiry = new AccountManager([oauth('a'), oauth('b')], 0.98, {
+    routingStrategy: 'expiry',
+    weeklyBalanceMargin: 0.10,
+  });
+  bucket(amExpiry, 0, 'unified7d', 0.50, 50);
+  bucket(amExpiry, 1, 'unified7d', 0.20, 50);
+  assert.equal(amExpiry.eligibility(0).eligible, true);
+});
+
 test('spill guards: unified5h >= 0.90 and pausedUntil in future independently block margin move; cleared guards allow it', () => {
   const am = new AccountManager([oauth('a'), oauth('b')], 0.98, {
     routingStrategy: 'balanced',
