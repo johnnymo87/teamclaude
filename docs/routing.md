@@ -153,15 +153,15 @@ Three strategies are supported:
 
 - **`"expiry"` (default)** — Prioritizes spending quota that is closest to expiring unspent. Ranks accounts by expiry pressure (headroom divided by time to reset). See [Expiry-pressure routing](#expiry-pressure-routing).
 - **`"balanced"`** — Distributes weekly quota across accounts. Ranks candidate accounts by weekly utilization ascending (lowest-utilized first), and moves the cursor when an available candidate's weekly utilization is lower than current by at least `weeklyBalanceMargin`. See [Balanced routing](#balanced-routing).
-- **`"drain"`** — Inert strategy. Disables dynamic pressure ranking and banding; accounts remain parked on the current account until the switch threshold, falling back to priority and config order.
+- **`"drain"`** — Inert strategy. Disables dynamic pressure ranking and banding; accounts remain parked on the current account until the switch threshold, falling back to priority and soonest weekly reset.
 
 ### Orthogonality of `routingStrategy` and `expiryRouting`
 
 `routingStrategy` and `expiryRouting.enabled` are orthogonal switches, not a precedence hierarchy:
 
 - `routingStrategy` controls the ranking and preemption function (`expiry`, `balanced`, or `drain`).
-- Under `"balanced"`, expiry pressure banding is explicitly **passthrough** (all candidates remain eligible rather than being narrowed by expiry pressure), and expiry-specific rollover preemption and session-quota reset switches are deactivated because the margin already steers traffic toward rolled, low-utilization accounts.
-- The sub-knobs in `expiryRouting` (`tolerance`, `preempt`) apply when `routingStrategy` is `"expiry"`.
+- Under `"balanced"`, expiry pressure banding is explicitly **passthrough** (all candidates remain eligible rather than being narrowed by expiry pressure). Expiry-specific rollover preemption across all four selection sites (`_select`, `_selectForSession`, `_selectDrainingSession`, and `previewRouteIndex`) and session-quota reset switches (`_switchOnSessionReset`) are deactivated because the margin already steers traffic toward rolled, low-utilization accounts.
+- The `tolerance` sub-knob in `expiryRouting` applies when `routingStrategy` is `"expiry"`. The `preempt` knob gates rollover and expiry preemption under `"expiry"`; under `"balanced"`, preemption is handled by the balance margin, but `preempt: true` still drives baseline observation writes (`_firstSightOn` / `_restOnCurrent`).
 
 ## Balanced routing
 
@@ -200,6 +200,7 @@ Under balanced routing, `teamclaude status --json` (and `GET /teamclaude/status`
   - `blocked_paused`: candidate had >= margin advantage but is paused.
   - `below_margin`: best candidate's W was not lower than current W by at least `weeklyBalanceMargin`.
   - `self_best`: current account already ranks best (or no candidate available) in steady state.
+  - `pin_released`: session-driven margin preemption released a session pin in `_selectForSession`.
 
 ## Expiry-pressure routing
 
