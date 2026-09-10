@@ -1546,7 +1546,10 @@ export class AccountManager {
     // is rotated off by selection on the very next request (see _marginPreemptedBy).
     // Phrased to read correctly after "<name> is ...", e.g. "outranked on weekly balance by ...".
     // Pass { count: false } so this read-only query does not mutate marginMove counters.
-    const marginPreemptor = this._marginPreemptedBy(account, null, null, null, null, { count: false });
+    // Partition by provider: exclude accounts belonging to other providers so that W is
+    // never compared cross-provider (design Q1).
+    const providerExclude = this._excludeOtherProviders(null, providerOf(account));
+    const marginPreemptor = this._marginPreemptedBy(account, null, null, providerExclude, null, { count: false });
     if (marginPreemptor) {
       return { eligible: false, reason: `outranked on weekly balance by "${marginPreemptor.name}"` };
     }
