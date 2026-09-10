@@ -367,10 +367,10 @@ test('rankingReset under balanced reads governing window resetAt, including scop
 });
 
 // ---------------------------------------------------------------------------
-// 8. _belowBandFloor inert under non-expiry strategies
+// 8. _belowBandFloor under balanced and drain strategies
 // ---------------------------------------------------------------------------
 
-test('belowBandFloor returns all zeros under balanced and drain even with expiryRouting enabled', () => {
+test('belowBandFloor holds off on W margin under balanced and returns all zeros under drain', () => {
   // Construct candidates where an expiry floor would hold someone off:
   // Account 'a' has known utilization and clock -> known pressure.
   // Account 'spent-noclock' has 0.95 utilization but no reset -> bounded absence with lowerBound.
@@ -396,8 +396,8 @@ test('belowBandFloor returns all zeros under balanced and drain even with expiry
   const amBalanced = build('balanced');
   assert.deepEqual(
     amBalanced._belowBandFloor(amBalanced.accounts, OPUS, now),
-    [0, 0],
-    'balanced strategy makes _belowBandFloor inert (all zeros)',
+    [0, 1],
+    'balanced strategy holds off spent-noclock whose W exceeds margin over cheapest candidate',
   );
 
   const amDrain = build('drain');
@@ -883,8 +883,11 @@ test('session pin re-routes under balanced when behind margin, stays pinned belo
     weeklyBalanceMargin: 0.10,
     distributeSessions: true,
   });
+  // a: 0.80 (preempted by c at 0.10, gap 0.70 >= 0.10)
+  // b: 0.15 (not preempted by c at 0.10, gap 0.05 < 0.10)
+  // c: 0.10 (cheapest)
   bucket(amMulti, 0, 'unified7d', 0.80, 50);
-  bucket(amMulti, 1, 'unified7d', 0.80, 50);
+  bucket(amMulti, 1, 'unified7d', 0.15, 50);
   bucket(amMulti, 2, 'unified7d', 0.10, 50);
   amMulti.recordSession('s3', 0, OPUS);
   amMulti.recordSession('s3', 1, FABLE);
@@ -896,8 +899,9 @@ test('session pin re-routes under balanced when behind margin, stays pinned belo
     return origComputeAllW();
   };
 
+  // Checks candidate a (preempted, computes allW), then candidate b (reuses allW, not preempted -> returned)
   const selectedMulti = amMulti.getActiveAccount(null, OPUS, null, 's3');
-  assert.equal(selectedMulti.name, 'c');
+  assert.equal(selectedMulti.name, 'b');
   assert.equal(
     computeCount,
     1,
@@ -929,5 +933,113 @@ test('previewRouteIndex and session pin preemption behave identically under expi
     assert.equal(selectedSession.name, 'a', `session pin must remain on account a under ${strategy} strategy`);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Task B (D6 [R1]): _pickLeastLoaded heldOff seam
+// ---------------------------------------------------------------------------
+
+test('_pickLeastLoaded under balanced: account exceeding margin above cheapest candidate is held off even with fewest sessions', () => {
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98, {
+    routingStrategy: 'balanced',
+    weeklyBalanceMargin: 0.10,
+    distributeSessions: true,
+  });
+  // a: W = 0.50, active sessions = 0
+  // b: W = 0.20, active sessions = 2
+  bucket(am, 0, 'unified7d', 0.50, 50);
+  bucket(am, 1, 'unified7d', 0.20, 50);
+
+  am.recordSession('s1', 1, OPUS);
+  am.recordSession('s2', 1, OPUS);
+
+  const now = Date.now();
+  assert.equal(am.sessionTracker.activeCountFor(0, now), 0);
+  assert.equal(am.sessionTracker.activeCountFor(1, now), 2);
+
+  // heldOff check: a has W gap 0.30 >= 0.10 -> heldOff = 1.
+  // b has W gap 0.00 < 0.10 -> heldOff = 0.
+  // heldOff comes before sessions, so b (heldOff=0) beats a (heldOff=1) despite having more sessions.
+  const picked = am._pickLeastLoaded(null, OPUS);
+  assert.equal(picked.name, 'b', 'balanced heldOff beats session count: cheaper account with more sessions must win');
+});
+
+test('_pickLeastLoaded under balanced: accounts within margin are not held off and load decides among them', () => {
+  const am = new AccountManager([oauth('b'), oauth('c')], 0.98, {
+    routingStrategy: 'balanced',
+    weeklyBalanceMargin: 0.10,
+    distributeSessions: true,
+  });
+  // b: W = 0.20, active sessions = 2
+  // c: W = 0.25, active sessions = 1
+  // W gap = 0.05 < margin 0.10 -> neither is held off (both heldOff = 0).
+  bucket(am, 0, 'unified7d', 0.20, 50);
+  bucket(am, 1, 'unified7d', 0.25, 50);
+
+  am.recordSession('s1', 0, OPUS);
+  am.recordSession('s2', 0, OPUS);
+  am.recordSession('s3', 1, OPUS);
+
+  const picked = am._pickLeastLoaded(null, OPUS);
+  assert.equal(picked.name, 'c', 'within margin, neither account is held off and load (fewer sessions) decides');
+});
+
+test('_pickLeastLoaded min(W) is candidate-scoped: excluded cheaper account does not change candidate heldOff', () => {
+  // Fleet of 3 accounts:
+  // cheap: index 0, W = 0.05, active sessions = 0
+  // med:   index 1, W = 0.14, active sessions = 2
+  // high:  index 2, W = 0.16, active sessions = 1
+  // margin = 0.10.
+  //
+  // Candidate set excludes cheap (index 0).
+  // Over candidates {med, high}:
+  // candidate min(W) = W(med) = 0.14.
+  // med:  0.14 - 0.14 = 0.00 < 0.10 -> heldOff = 0.
+  // high: 0.16 - 0.14 = 0.02 < 0.10 -> heldOff = 0.
+  // Neither candidate is held off. Load decides: high has 1 session < med (2 sessions) -> high wins.
+  //
+  // (If min(W) were fleet-wide instead of candidate-scoped, min(W) = 0.05:
+  //  med:  0.14 - 0.05 = 0.09 < 0.10 -> heldOff = 0.
+  //  high: 0.16 - 0.05 = 0.11 >= 0.10 -> heldOff = 1.
+  //  Then med would win due to false heldOff on high).
+  const am = new AccountManager([oauth('cheap'), oauth('med'), oauth('high')], 0.98, {
+    routingStrategy: 'balanced',
+    weeklyBalanceMargin: 0.10,
+    distributeSessions: true,
+  });
+  bucket(am, 0, 'unified7d', 0.05, 50);
+  bucket(am, 1, 'unified7d', 0.14, 50);
+  bucket(am, 2, 'unified7d', 0.16, 50);
+
+  am.recordSession('s1', 1, OPUS);
+  am.recordSession('s2', 1, OPUS);
+  am.recordSession('s3', 2, OPUS);
+
+  const exclude = new Set([0]); // exclude cheap
+  const picked = am._pickLeastLoaded(exclude, OPUS);
+  assert.equal(
+    picked.name,
+    'high',
+    'candidate-scoped min(W) ensures high is not held off; fewer sessions picks high',
+  );
+});
+
+test('_belowBandFloor and _pickLeastLoaded preserve expiry strategy behaviour byte-for-byte', () => {
+  const now = Date.now();
+  const amExpiry = new AccountManager([oauth('a'), oauth('spent-noclock')], 0.98, {
+    routingStrategy: 'expiry',
+    weeklyBalanceMargin: 0.10,
+    distributeSessions: true,
+    expiryRouting: { enabled: true, tolerance: 1.5 },
+  });
+  bucket(amExpiry, 0, 'unified7d', 0.10, 10, now);
+  const q = amExpiry.accounts[1].quota;
+  q.unified7d = 0.95;
+  q.unified7dReset = null; // no clock -> lowerBound is ~0.05 / (7 * 86400)
+  amExpiry.accounts[1].probing = false;
+
+  const spent = amExpiry._belowBandFloor(amExpiry.accounts, OPUS, now);
+  assert.deepEqual(spent, [0, 1], 'expiry band floor holds off spent-noclock account based on expiry pressure');
+});
+
 
 

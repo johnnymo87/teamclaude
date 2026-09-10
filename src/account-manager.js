@@ -1834,8 +1834,22 @@ export class AccountManager {
    * discoverable, and an account with no reading at all is never held off.
    */
   _belowBandFloor(candidates, model, now) {
+    if (this.routingStrategy === 'balanced') {
+      if (!candidates || candidates.length === 0) return [];
+      // Under balanced routing, heldOff acts as the weekly balance guard in
+      // _pickLeastLoaded (design D6 [R1]). It sits before load terms so that load
+      // cannot override weekly balance: an account more than weeklyBalanceMargin
+      // above the cheapest candidate is held off (1), even if it has fewer
+      // active sessions. min(W) is strictly over the CANDIDATE SET, not the fleet
+      // (design O1 corollary), preserving provider partitioning and candidate scoping.
+      // W is computed once here per _pickLeastLoaded call.
+      const allW = this._computeAllW();
+      const candidateW = candidates.map(a => allW[a.index]?.value ?? 0);
+      const minW = Math.min(...candidateW);
+      return candidateW.map(w => (w - minW >= this.weeklyBalanceMargin ? 1 : 0));
+    }
     // The band floor is an expiry-pressure concept. Non-expiry strategies
-    // return all-zeros (nothing held off); task T7 introduces balanced heldOff.
+    // (e.g. drain) return all-zeros (nothing held off).
     if (this.routingStrategy !== 'expiry' || !this.expiryRouting.enabled) return candidates.map(() => 0);
     const snapshot = this._bandSnapshot(candidates, model, now);
     const decision = decideBand(snapshot);
