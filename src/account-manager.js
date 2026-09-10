@@ -801,6 +801,7 @@ export class AccountManager {
     for (const idx of this.sessionTracker.pinnedAccounts(sessionId)) {
       if (!candidates.includes(idx)) candidates.push(idx);
     }
+    let allW = null;
     for (const idx of candidates) {
       const pinned = this.accounts[idx];
       if (!pinned) continue;
@@ -835,7 +836,17 @@ export class AccountManager {
       // still wins over a session's stickiness.
       const betterExists = this.accounts.some(a =>
         this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (pinned.priority || 0));
-      if (!betterExists) return pinned;
+      if (betterExists) continue;
+      // Mirror _select's margin preemption (balanced routing): release the pin
+      // when another candidate has lower weekly utilization W by at least
+      // weeklyBalanceMargin. Without this, session pins never margin-move and
+      // concentrate spend indefinitely on pinned accounts. allW is computed at
+      // most once across candidates to keep W frozen within this decision (D4).
+      if (this.routingStrategy === 'balanced') {
+        allW ??= this._computeAllW();
+        if (this._marginPreemptedBy(pinned, model, advisorModel, exclude, allW)) continue;
+      }
+      return pinned;
     }
     // No pin was usable, so this is a placement. Placing is aiming: it takes no
     // reading, and the next request to find the pin here takes it.
@@ -974,7 +985,17 @@ export class AccountManager {
         this._isAvailable(a, model) && (a.priority || 0) < (current.priority || 0));
       const rolled = this.expiryRouting.enabled && this.expiryRouting.preempt
         && this._currentRolledOver(current, model);
-      if (!better && !rolled) return current.index;
+      // Mirror _select's margin preemption (balanced routing): rotate away from
+      // current when an available candidate has lower weekly utilization W by at
+      // least weeklyBalanceMargin. Without this, the preview marker points at the
+      // current account while routing rotates off it on the next selection.
+      // previewRouteIndex is read-only: no cursor moves, no observations written,
+      // and no ramp started.
+      const marginWinner = (!better && !rolled && this.routingStrategy === 'balanced')
+        ? this._marginPreemptedBy(current, model)
+        : null;
+      if (!better && !rolled && !marginWinner) return current.index;
+      if (marginWinner) return marginWinner.index;
     }
     // Mirror _select's diversion cursor, so the preview names the account a
     // diverted family will actually land on rather than the one a fresh walk
