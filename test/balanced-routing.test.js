@@ -1343,5 +1343,197 @@ test('_belowBandFloor and _pickLeastLoaded preserve expiry strategy behaviour by
   assert.deepEqual(spent, [0, 1], 'expiry band floor holds off spent-noclock account based on expiry pressure');
 });
 
+// ---------------------------------------------------------------------------
+// 11. Spec-review test coverage: W > 1.0 unclamped, advisor pass purity, Finding 1
+// ---------------------------------------------------------------------------
+
+test('W > 1.0 is not clamped end-to-end: flows through family-proxy, median, margin preemption, and belowBandFloor heldOff', () => {
+  const now = Date.now();
+  const am = new AccountManager([
+    oauth('a'), // current, unified7dFable = 1.3 -> W = 1.3 (family-proxy)
+    oauth('b'), // unprobed -> inherits median = 1.3
+    oauth('c'), // unified7d = 0.95 -> W = 0.95 (unified)
+  ], 0.98, {
+    routingStrategy: 'balanced',
+    weeklyBalanceMargin: 0.10,
+  });
+
+  am.currentIndex = 0;
+  // a: Fable spent beyond 1.0 (1.3 overage), but unified7d is null, so available for OPUS
+  am.accounts[0].quota.unified7dFable = 1.3;
+  am.accounts[0].quota.unified7dReset = now + 100 * H;
+  am.accounts[0].probing = false;
+
+  // b: unprobed (null quota)
+  am.accounts[1].quota.unified7d = null;
+  am.accounts[1].quota.unified7dReset = now + 100 * H;
+  am.accounts[1].probing = false;
+
+  // c: near cap (0.95), unified5h low (0.10)
+  bucket(am, 2, 'unified7d', 0.95, 50, now);
+  am.accounts[2].quota.unified5h = 0.10;
+
+  // 1. _computeAllW preserves W > 1.0 for family-proxy and per-provider median
+  // (Pass 1 resolved values: [1.3, 0.95]. Median of [0.95, 1.3] is (0.95 + 1.3) / 2 = 1.125 > 1.0)
+  const Ws = am._computeAllW();
+  assert.deepEqual(Ws[0], { value: 1.3, provenance: 'family-proxy' });
+  assert.deepEqual(Ws[1], { value: 1.125, provenance: 'median' });
+  assert.deepEqual(Ws[2], { value: 0.95, provenance: 'unified' });
+
+  // 2. Also check fleet of two [a, b] where median is exactly 1.3
+  const amTwo = new AccountManager([oauth('a'), oauth('b')], 0.98, {
+    routingStrategy: 'balanced',
+    weeklyBalanceMargin: 0.10,
+  });
+  amTwo.accounts[0].quota.unified7dFable = 1.3;
+  const WsTwo = amTwo._computeAllW();
+  assert.deepEqual(WsTwo[0], { value: 1.3, provenance: 'family-proxy' });
+  assert.deepEqual(WsTwo[1], { value: 1.3, provenance: 'median' });
+
+  // 3. _marginPreemptedBy: unclamped W diff is 1.3 - 0.95 = 0.35 >= 0.10 -> preempts to c.
+  // If W were clamped to 1.0, 1.0 - 0.95 = 0.05 < 0.10 and preemption would NOT fire.
+  assert.equal(am._isAvailable(am.accounts[0], OPUS), true, 'account a is available for OPUS');
+  assert.equal(am._isAvailable(am.accounts[2], OPUS), true, 'account c is available for OPUS');
+  const preemptor = am._marginPreemptedBy(am.accounts[0], OPUS);
+  assert.equal(preemptor?.name, 'c', '_marginPreemptedBy must preempt to c because 1.3 - 0.95 >= 0.10');
+
+  const selected = am.getActiveAccount(null, OPUS);
+  assert.equal(selected.name, 'c', 'selection must switch to c on unclamped margin');
+  assert.equal(am.currentIndex, 2);
+
+  // 4. _belowBandFloor: W > 1.0 reaches heldOff seam for both family-proxy and median
+  // For [a, c]: a (1.3) vs c (0.95) -> diff 0.35 >= 0.10 -> [1, 0]
+  // (If clamped to 1.0, diff 0.05 < 0.10 -> [0, 0])
+  const heldOffDirect = am._belowBandFloor([am.accounts[0], am.accounts[2]], OPUS, now);
+  assert.deepEqual(heldOffDirect, [1, 0], 'candidate with family-proxy W = 1.3 is held off against W = 0.95');
+
+  // For [b, c]: b (median 1.125) vs c (0.95) -> diff 0.175 >= 0.10 -> [1, 0]
+  // (If clamped to 1.0, diff 0.05 < 0.10 -> [0, 0])
+  const heldOffMedian = am._belowBandFloor([am.accounts[1], am.accounts[2]], OPUS, now);
+  assert.deepEqual(heldOffMedian, [1, 0], 'candidate with median W = 1.125 is held off against W = 0.95');
+
+  // For two-account fleet [a, b] with candidate c: b has median 1.3
+  const heldOffExactMedian = amTwo._belowBandFloor([amTwo.accounts[1], am.accounts[2]], OPUS, now);
+  assert.deepEqual(heldOffExactMedian, [1, 0], 'candidate with median W = 1.3 is held off against W = 0.95');
+});
+
+test('advisor pass never mutates under balanced routing: does not move cursor, seed observations, or increment marginMove counters', () => {
+  // Case 1: An advisor request degrades to executor-only when no account can serve the advisor model.
+  // Neither account can serve Fable. Account a has lower W (0.20) than b (0.25), diff < margin.
+  {
+    const am = new AccountManager([oauth('a'), oauth('b')], 0.98, {
+      routingStrategy: 'balanced',
+      weeklyBalanceMargin: 0.10,
+    });
+    am.currentIndex = 0;
+    bucket(am, 0, 'unified7d', 0.20, 50);
+    bucket(am, 0, 'unified7dFable', 1.0, 50); // Fable spent
+    bucket(am, 1, 'unified7d', 0.25, 50);
+    bucket(am, 1, 'unified7dFable', 1.0, 50); // Fable spent
+
+    const initialCounters = { ...am.marginMove };
+    assert.equal(am._currentObs, null);
+
+    // Direct check of advisor-constrained pass in isolation:
+    const pass1 = am._select(null, OPUS, FABLE, false);
+    assert.equal(pass1, null, 'pass 1 returns null when no account satisfies advisor model');
+    assert.equal(am.currentIndex, 0, 'pass 1 must not move currentIndex');
+    assert.equal(am._currentObs, null, 'pass 1 must not seed _currentObs');
+    assert.deepEqual(am.marginMove, initialCounters, 'pass 1 must not increment marginMove counters');
+
+    // Full selection degrading to executor-only:
+    const chosen = am.getActiveAccount(null, OPUS, FABLE);
+    assert.equal(chosen.name, 'a', 'degrades to executor-only returning account a');
+    assert.equal(am.currentIndex, 0, 'cursor must stay on account a');
+    assert.equal(am._currentObs, null, '_currentObs must not be seeded on b');
+    assert.equal(am.marginMove.done, 0, 'marginMove.done must not increment');
+  }
+
+  // Case 2: Off-pointer advisor serving (fork test 5 shape).
+  // Current account a cannot serve Fable; account b can.
+  // W(a) = 0.20, W(b) = 0.10 (diff = 0.10 >= margin 0.10).
+  {
+    const am = new AccountManager([oauth('a'), oauth('b')], 0.98, {
+      routingStrategy: 'balanced',
+      weeklyBalanceMargin: 0.10,
+    });
+    am.currentIndex = 0;
+    bucket(am, 0, 'unified7d', 0.20, 50);
+    bucket(am, 0, 'unified7dFable', 1.0, 50); // a cannot serve Fable advisor
+    bucket(am, 1, 'unified7d', 0.10, 50);
+    bucket(am, 1, 'unified7dFable', 0.10, 50); // b can serve Fable advisor
+
+    const initialCounters = { ...am.marginMove };
+
+    const acc = am.getActiveAccount(null, OPUS, FABLE);
+    assert.equal(acc.name, 'b', 'account b serves the advisor request');
+    assert.equal(am.currentIndex, 0, 'advisor pass is read-only on cursor; currentIndex untouched');
+    assert.equal(am._currentObs, null, 'off-pointer advisor serving must not seed _currentObs');
+    assert.equal(am.marginMove.done, 0, 'off-pointer advisor serving must not count as marginMove.done');
+    assert.deepEqual(am.marginMove, initialCounters, 'marginMove counters untouched by off-pointer advisor serving');
+  }
+
+  // Case 3: Session affinity advisor pass (_selectForSession).
+  // Pinned account evaluated against advisorModel under balanced.
+  {
+    const am = new AccountManager([oauth('a'), oauth('b')], 0.98, {
+      routingStrategy: 'balanced',
+      weeklyBalanceMargin: 0.10,
+      distributeSessions: true,
+    });
+    bucket(am, 0, 'unified7d', 0.20, 50);
+    bucket(am, 1, 'unified7d', 0.10, 50);
+    am.recordSession('s1', 0, OPUS);
+
+    const countersBefore = { ...am.marginMove };
+    am._selectForSession('s1', null, OPUS, FABLE);
+    assert.deepEqual(am.marginMove, countersBefore, '_selectForSession must pass count: false and not mutate marginMove counters');
+  }
+});
+
+test('Finding 1 regression: family-gated request does not rank-move cursor away from priority winner', () => {
+  const am = new AccountManager([
+    oauth('a', { priority: 0 }),
+    oauth('b', { priority: 1 }),
+  ], 0.98, {
+    routingStrategy: 'balanced',
+    weeklyBalanceMargin: 0.10,
+  });
+  am.currentIndex = 0;
+  bucket(am, 0, 'unified7d', 0.50, 50);
+  bucket(am, 0, 'unified7dFable', 1.0, 50); // a is Fable-gated, but Opus is fine
+  bucket(am, 1, 'unified7d', 0.30, 50);
+  bucket(am, 1, 'unified7dFable', 0.30, 50); // b can serve both, lower W, but priority 1
+
+  // 1. Initial state check: account a is priority winner, available for OPUS but barred for FABLE
+  assert.equal(am.currentIndex, 0);
+  assert.equal(am._isAvailable(am.accounts[0], OPUS), true);
+  assert.equal(am._isAvailable(am.accounts[0], FABLE), false);
+  assert.equal(am._currentBarredOnlyFor(FABLE), true);
+
+  // 2. Interleaved requests across models: FABLE must divert to b, OPUS must stay on a,
+  // and cursor (currentIndex) must NEVER move away from priority winner a.
+  let pointerSwitches = 0;
+  let lastPointer = am.currentIndex;
+
+  for (let i = 0; i < 6; i++) {
+    const model = (i % 2 === 0) ? FABLE : OPUS;
+    const chosen = am.getActiveAccount(null, model);
+    if (model === FABLE) {
+      assert.equal(chosen.name, 'b', `request ${i} (FABLE) must divert to account b`);
+    } else {
+      assert.equal(chosen.name, 'a', `request ${i} (OPUS) must be served by priority winner a`);
+    }
+    if (am.currentIndex !== lastPointer) {
+      pointerSwitches++;
+      lastPointer = am.currentIndex;
+    }
+  }
+
+  assert.equal(pointerSwitches, 0, 'cursor must never move away from priority winner');
+  assert.equal(am.currentIndex, 0, 'currentIndex must remain 0');
+});
+
+
 
 
