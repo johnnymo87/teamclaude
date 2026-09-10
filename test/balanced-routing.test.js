@@ -697,6 +697,27 @@ test('eligibility() under balanced routing reports ineligibility when outranked 
   assert.equal(amExpiry.eligibility(0).eligible, true);
 });
 
+test('eligibility() under balanced routing does not compare across providers on mixed fleet', () => {
+  const am = new AccountManager([
+    oauth('claude-1'),
+    oauth('claude-2'),
+    oauth('codex-1', { provider: 'codex', accountId: 'acct-codex-1' }),
+  ], 0.98, {
+    routingStrategy: 'balanced',
+    weeklyBalanceMargin: 0.10,
+  });
+
+  bucket(am, 0, 'unified7d', 0.50, 50);
+  bucket(am, 1, 'unified7d', 0.55, 50);
+  bucket(am, 2, 'unified7d', 0.05, 50); // codex-1 has low W
+
+  // claude-1 has W = 0.50. claude-2 has W = 0.55 (within margin 0.10).
+  // codex-1 has W = 0.05 (diff = 0.45 >= margin 0.10).
+  // Because codex-1 is from a different provider, W must not be compared cross-provider (design Q1).
+  const res = am.eligibility(0);
+  assert.equal(res.eligible, true, 'claude-1 must not be marked ineligible due to codex-1');
+});
+
 test('spill guards: unified5h >= 0.90 and pausedUntil in future independently block margin move; cleared guards allow it', () => {
   const am = new AccountManager([oauth('a'), oauth('b')], 0.98, {
     routingStrategy: 'balanced',
