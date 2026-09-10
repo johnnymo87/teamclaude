@@ -1236,6 +1236,82 @@ test('rollover preemption is gated on strategy === "expiry": inert under balance
   }
 });
 
+test('_selectDrainingSession rollover preemption is gated on strategy === "expiry": inert under balanced, active under expiry', () => {
+  const WEEK = 7 * 24 * H;
+
+  // 1. Under balanced routing:
+  // With distributeSessions flipped off and drain active, a draining session whose
+  // pin rolls over must NOT be dropped from the drain. Under balanced, rollover
+  // preemption is deactivated across all four sites (D9).
+  {
+    const am = new AccountManager([oauth('a'), oauth('b')], 0.98, {
+      routingStrategy: 'balanced',
+      weeklyBalanceMargin: 0.10,
+      expiryRouting: { enabled: true, preempt: true },
+    });
+    bucket(am, 0, 'unified7d', 0.20, 10);
+    bucket(am, 1, 'unified7d', 0.40, 10);
+
+    am.setDistributeSessions(true);
+    am.beginSession('s1');
+    const acc = am.getActiveAccount(null, OPUS, null, 's1');
+    am.recordSession('s1', acc.index, OPUS);
+    am.endSession('s1');
+    assert.equal(acc.name, 'a');
+
+    // Flip distributeSessions off with drain = true (default)
+    am.setDistributeSessions(false);
+    assert.equal(am._isDrainingSession('s1'), true);
+    assert.equal(am.drainingCount(), 1);
+
+    // Roll window on pinned account a
+    am.accounts[0].quota.unified7dReset += WEEK;
+
+    // Under balanced, request for s1 must keep its pin on a and NOT drop from draining
+    am.beginSession('s1');
+    const nextAcc = am.getActiveAccount(null, OPUS, null, 's1');
+    am.endSession('s1');
+
+    assert.equal(nextAcc.name, 'a', 'draining session must stay pinned to a under balanced');
+    assert.equal(am._isDrainingSession('s1'), true, 'session s1 must remain in draining set under balanced');
+    assert.equal(am.drainingCount(), 1, 'draining count must remain 1 under balanced');
+  }
+
+  // 2. Under expiry routing:
+  // Rollover preemption IS active: a draining session whose pin rolls over hits break,
+  // drops from the drain, and rejoins the normal rotation.
+  {
+    const am = new AccountManager([oauth('a'), oauth('b')], 0.98, {
+      routingStrategy: 'expiry',
+      expiryRouting: { enabled: true, preempt: true },
+    });
+    bucket(am, 0, 'unified7d', 0.20, 10);
+    bucket(am, 1, 'unified7d', 0.40, 10);
+
+    am.setDistributeSessions(true);
+    am.beginSession('s1');
+    const acc = am.getActiveAccount(null, OPUS, null, 's1');
+    am.recordSession('s1', acc.index, OPUS);
+    am.endSession('s1');
+    assert.equal(acc.name, 'a');
+
+    am.setDistributeSessions(false);
+    assert.equal(am._isDrainingSession('s1'), true);
+    assert.equal(am.drainingCount(), 1);
+
+    // Roll window on pinned account a
+    am.accounts[0].quota.unified7dReset += WEEK;
+
+    // Under expiry, request for s1 must drop the session from draining
+    am.beginSession('s1');
+    am.getActiveAccount(null, OPUS, null, 's1');
+    am.endSession('s1');
+
+    assert.equal(am._isDrainingSession('s1'), false, 'session s1 must be dropped from draining set under expiry');
+    assert.equal(am.drainingCount(), 0, 'draining count must be 0 under expiry');
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Task B (D6 [R1]): _pickLeastLoaded heldOff seam
 // ---------------------------------------------------------------------------
