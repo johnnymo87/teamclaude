@@ -8,6 +8,7 @@ import { SessionTracker } from './session-tracker.js';
 import { buildQuotaSummary } from './quota-summary.js';
 import { ROLLOVER_MIN_JUMP_MS, remapHeld } from './rollover.js';
 import { decideBand, pressureOf, pressureRank, assertNever } from './band-decision.js';
+import { VALID_ROUTING_STRATEGIES } from './config.js';
 
 // Re-exported for callers that import these model helpers from here.
 export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
@@ -26,6 +27,17 @@ const ENTITLEMENT_DENIAL_COOLDOWN_SECONDS = 5 * 60;
 // Fallback when a per-bucket threshold table names neither the bucket nor a
 // `default` — the same value the single-number form has always used.
 export const DEFAULT_SWITCH_THRESHOLD = 0.98;
+
+// Upstream quota arrives in 0.01 quanta (e.g. 0.20, 0.30, 0.87, 0.97). In IEEE 754
+// floating-point representation, differences between two exact 0.01 multiples
+// (such as 0.30 - 0.20 = 0.09999999999999998 or 0.97 - 0.87 = 0.09999999999999998)
+// frequently fall infinitesimal amounts below the nominal decimal difference.
+// Without an epsilon tolerance, margin comparisons (diff >= weeklyBalanceMargin)
+// fail at exactly the margin boundary on roughly half of all value pairs, causing
+// margin preemption and held-off floor decisions to fire one quantum late.
+// 1e-9 is vastly smaller than the minimum 0.01 quota quantum and weeklyBalanceMargin
+// clamp (>= 0.02), yet vastly larger than IEEE 754 float roundoff (~1e-16).
+export const MARGIN_FLOAT_EPSILON = 1e-9;
 
 // Quota fields that survive a restart: utilization levels and their reset
 // windows, learned passively from upstream responses. Transient/derived state
@@ -197,7 +209,7 @@ function sampleModelFor(route) {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker, expiryRouting } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker, expiryRouting, routingStrategy = 'expiry', weeklyBalanceMargin = 0.10 } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -213,6 +225,54 @@ export class AccountManager {
     // accounts by load instead of funnelling them all onto the current one.
     this.sessionTracker = sessionTracker || new SessionTracker();
     this.distributeSessions = !!distributeSessions;
+    // Routing strategy determines the pressure ranking function ('expiry' | 'balanced' | 'drain').
+    // Default is 'expiry' matching historic deployed behaviour. An unknown value fails loudly.
+    const strategy = routingStrategy === undefined ? 'expiry' : routingStrategy;
+    if (!VALID_ROUTING_STRATEGIES.includes(strategy)) {
+      throw new Error(`Invalid routingStrategy "${strategy}". Must be one of: ${VALID_ROUTING_STRATEGIES.join(', ')}`);
+    }
+    this.routingStrategy = strategy;
+
+    // Hysteresis margin for balanced rotation (design D4 item 1).
+    // The cycle-freedom proof requires margin > 0 strictly; clamping to >= 0
+    // (as the old fork did) admitted A→B→A flapping. Upstream quota updates
+    // arrive in 0.01 quanta, so margins below 0.02 would flap on single-quantum
+    // differences (period ≈ margin / spend-rate), thrashing prompt caches
+    // across live sessions. We clamp to >= 0.02 and warn below 0.05.
+    // Non-finite or absent values fall back to the 0.10 default, matching the
+    // tolerance clamping style at :1486-1488.
+    if (typeof weeklyBalanceMargin === 'number' && Number.isFinite(weeklyBalanceMargin) && weeklyBalanceMargin < 0.05) {
+      console.warn(`[TeamClaude] weeklyBalanceMargin ${weeklyBalanceMargin} is below 0.05; small margins cause frequent rotation and cache thrashing`);
+    }
+    this.weeklyBalanceMargin = typeof weeklyBalanceMargin === 'number' && Number.isFinite(weeklyBalanceMargin)
+      ? Math.max(0.02, weeklyBalanceMargin)
+      : 0.10;
+
+    // Counters for margin-driven preemption outcomes (design D8, bead yri.8).
+    //
+    // Why this exists:
+    // The margin's spill guard blocks every margin move while the best candidate
+    // sits at unified5h >= 0.90 — which is exactly the fleet's busy period. In
+    // that window balanced silently behaves as drain. More generally, the failure
+    // mode this defends against is shipping "balanced" that quietly behaves as
+    // expiry or drain with nobody noticing. This must be observable, not inferred.
+    //
+    // Keys:
+    // - done: margin preemption successfully rotated cursor to lower-W candidate.
+    // - blocked_5h: candidate W had >= margin advantage but unified5h >= 0.90.
+    // - blocked_paused: candidate W had >= margin advantage but candidate is paused.
+    // - below_margin: candidate W was not lower than current W by >= weeklyBalanceMargin.
+    // - self_best: current account already ranks best or no candidate was available.
+    // - pin_released: session-driven margin preemption released a session pin in _selectForSession.
+    this.marginMove = {
+      done: 0,
+      blocked_5h: 0,
+      blocked_paused: 0,
+      below_margin: 0,
+      self_best: 0,
+      pin_released: 0,
+    };
+
     // Sessions still being drained after distribution was turned off (see
     // setDistributeSessions). null = not draining; a Set of session ids otherwise.
     this._drainingSessions = null;
@@ -707,7 +767,12 @@ export class AccountManager {
       // low-utilization fleets never reach. Every pass reaching here decides the
       // request, the advisor-constrained one included; `allowProbe` gates the
       // exhausted-fleet probe, not which pass is final.
-      const rolled = this.expiryRouting.enabled && this.expiryRouting.preempt
+      // Under balanced, the margin already pulls traffic toward a rolled account
+      // (its W is ~0), so rollover preemption is redundant, and its expiry-semantic
+      // trigger does not belong to this strategy. Firing it under balanced causes
+      // steady-state log spam when the rolled account is best and breaks equal-W
+      // ties on soonest reset rather than respecting weekly balance.
+      const rolled = this.routingStrategy === 'expiry' && this.expiryRouting.enabled && this.expiryRouting.preempt
         && this._currentRolledOver(current, model);
       if (rolled) {
         const next = this._selectNext(exclude, model, advisorModel);
@@ -729,6 +794,16 @@ export class AccountManager {
       }
       const betterExists = this._preemptedBy(current, model, advisorModel, exclude);
       if (betterExists) return this._selectNext(exclude, model, advisorModel);
+      // Margin preemption (balanced routing): rotate away from current when an
+      // available candidate has lower weekly utilization W by at least weeklyBalanceMargin.
+      // Checked after priority preemption because operator priority is explicit intent
+      // that beats the margin. Routed through _selectNext -> _setCurrent so the
+      // rollover baseline is seeded via _firstSightOn (design D5).
+      // Thread marginWinner through to _selectNext as preselected (D4 precondition 4):
+      // recomputing _pickBestAvailable inside _selectNext could pick a newly-available
+      // candidate (e.g. throttle expiring between calls) with an untested W gap.
+      const marginWinner = this._marginPreemptedBy(current, model, advisorModel, exclude);
+      if (marginWinner) return this._selectNext(exclude, model, advisorModel, marginWinner);
       return current;
     }
     // Barred for this request only: keep the family where it was diverted.
@@ -771,6 +846,7 @@ export class AccountManager {
     for (const idx of this.sessionTracker.pinnedAccounts(sessionId)) {
       if (!candidates.includes(idx)) candidates.push(idx);
     }
+    let allW = null;
     for (const idx of candidates) {
       const pinned = this.accounts[idx];
       if (!pinned) continue;
@@ -785,7 +861,9 @@ export class AccountManager {
       // candidate rather than the bucket's pin alone, since a session sitting on
       // another family's account is just as stuck, and a rollover re-ranks so
       // that pressure picks the destination.
-      if (this.expiryRouting.enabled && this.expiryRouting.preempt
+      // Gated on strategy === 'expiry': under balanced, margin preemption already
+      // pulls traffic toward rolled accounts and rollover preemption does not belong.
+      if (this.routingStrategy === 'expiry' && this.expiryRouting.enabled && this.expiryRouting.preempt
           && this._pinRolledOver(sessionId, pinned, model)) {
         const next = this._pickLeastLoaded(exclude, model, advisorModel);
         if (next && next.index !== idx) {
@@ -805,7 +883,27 @@ export class AccountManager {
       // still wins over a session's stickiness.
       const betterExists = this.accounts.some(a =>
         this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (pinned.priority || 0));
-      if (!betterExists) return pinned;
+      if (betterExists) continue;
+      // Mirror _select's margin preemption (balanced routing): release the pin
+      // when another candidate has lower weekly utilization W by at least
+      // weeklyBalanceMargin. Without this, session pins never margin-move and
+      // concentrate spend indefinitely on pinned accounts. allW is computed at
+      // most once across candidates to keep W frozen within this decision (D4).
+      if (this.routingStrategy === 'balanced') {
+        allW ??= this._computeAllW();
+        // Unpin check: pass { count: false } to _marginPreemptedBy because releasing
+        // a pin here falls through to _pickLeastLoaded (which load-balances on active
+        // session counts rather than necessarily routing to the margin winner) and
+        // does not move the global cursor. Leaving cursor-move keys (done, blocked_5h,
+        // blocked_paused, below_margin, self_best) honest avoids corrupting cursor
+        // observability metrics (D8), while incrementing pin_released allows D8 to
+        // observe session-driven margin activity and avoid false-positive stuck alerts.
+        if (this._marginPreemptedBy(pinned, model, advisorModel, exclude, allW, { count: false })) {
+          this.marginMove.pin_released++;
+          continue;
+        }
+      }
+      return pinned;
     }
     // No pin was usable, so this is a placement. Placing is aiming: it takes no
     // reading, and the next request to find the pin here takes it.
@@ -942,9 +1040,20 @@ export class AccountManager {
       // available account wins over a healthy current one; same tier stays put.
       const better = this.accounts.some(a =>
         this._isAvailable(a, model) && (a.priority || 0) < (current.priority || 0));
-      const rolled = this.expiryRouting.enabled && this.expiryRouting.preempt
+      const rolled = this.routingStrategy === 'expiry' && this.expiryRouting.enabled && this.expiryRouting.preempt
         && this._currentRolledOver(current, model);
-      if (!better && !rolled) return current.index;
+      // Mirror _select's margin preemption (balanced routing): rotate away from
+      // current when an available candidate has lower weekly utilization W by at
+      // least weeklyBalanceMargin. Without this, the preview marker points at the
+      // current account while routing rotates off it on the next selection.
+      // previewRouteIndex is read-only: no cursor moves, no observations written,
+      // no ramp started, and no counters incremented ({ count: false }) — otherwise
+      // marginMove would measure the TUI's poll/refresh rate rather than routing decisions.
+      const marginWinner = (!better && !rolled && this.routingStrategy === 'balanced')
+        ? this._marginPreemptedBy(current, model, null, null, null, { count: false })
+        : null;
+      if (!better && !rolled && !marginWinner) return current.index;
+      if (marginWinner) return marginWinner.index;
     }
     // Mirror _select's diversion cursor, so the preview names the account a
     // diverted family will actually land on rather than the one a fresh walk
@@ -1067,6 +1176,99 @@ export class AccountManager {
     const q = account.quota;
     const key = this._weeklyBucketFor(model);
     return q[`${key}Reset`] || this._scopedWeekly(account, model)?.resetAt || q.unified7dReset || null;
+  }
+
+  /**
+   * Compute model-INDEPENDENT weekly utilization scalar W for ALL accounts at once,
+   * partitioned per provider.
+   *
+   * W is model-INDEPENDENT by construction: it takes no `model` argument and must
+   * never consult one. The cycle-freedom proof depends on this (design D4 item 3):
+   * if W varied across models within a decision, margin comparisons between
+   * requests could cycle across model switches.
+   *
+   * Why per-provider (design "Open questions — RESOLVED" Q1): every W comparison
+   * is already intra-provider (getActiveAccount borrows the cursor per provider;
+   * _excludeOtherProviders strips foreign accounts), so partitioning costs
+   * nothing. A fleet-wide median would let one provider's numbers manufacture a
+   * cursor move in another's: e.g. an Anthropic fleet at {0.64, 0.43, 0.39, 0.11}
+   * plus two cheap Codex accounts at {0.05, 0.08} gives a fleet median ~0.25,
+   * which an unprobed Anthropic account inherits, becoming best; the cursor moves
+   * onto it, it probes at 0.95, and the cursor moves straight back — two prompt-
+   * cache storms manufactured by another provider's numbers.
+   *
+   * Why 0 / 'empty' is safe as the per-provider floor even though W=0 reads as
+   * "completely unspent" and would normally be maximally attractive: if a group
+   * has nothing resolved, every member gets the same constant, so all
+   * within-group W differences are 0 and no margin move can fire. "Maximally
+   * attractive" only bites against known values, which by construction do not
+   * exist in that group.
+   *
+   * Algorithm, applied independently within each provider group:
+   * Pass 1:
+   *   - quota.unified7d != null -> { value: quota.unified7d, provenance: 'unified' }
+   *   - else if any of unified7dFable / unified7dSonnet is non-null ->
+   *       { value: max(those present), provenance: 'family-proxy' }
+   *   - else unresolved.
+   * Pass 2:
+   *   - unresolved accounts in that group get { value: median(group pass-1 resolved), provenance: 'median' }.
+   *   - if that group has NO pass-1 resolved accounts, every account gets { value: 0, provenance: 'empty' }.
+   * Median convention: sort ascending; odd count -> middle element; even count -> mean of two middle elements.
+   *
+   * @returns {Array<{ value: number, provenance: 'unified' | 'family-proxy' | 'median' | 'empty' }>}
+   */
+  _computeAllW() {
+    const results = new Array(this.accounts.length);
+    const byProvider = new Map();
+
+    for (let i = 0; i < this.accounts.length; i++) {
+      const acc = this.accounts[i];
+      const provider = providerOf(acc);
+      let group = byProvider.get(provider);
+      if (!group) {
+        group = { unresolvedIndices: [], pass1Resolved: [] };
+        byProvider.set(provider, group);
+      }
+
+      const q = acc.quota || {};
+      if (q.unified7d != null) {
+        const res = { value: q.unified7d, provenance: 'unified' };
+        results[i] = res;
+        group.pass1Resolved.push(res.value);
+      } else {
+        const familyVals = [];
+        if (q.unified7dFable != null) familyVals.push(q.unified7dFable);
+        if (q.unified7dSonnet != null) familyVals.push(q.unified7dSonnet);
+        if (familyVals.length > 0) {
+          const res = { value: Math.max(...familyVals), provenance: 'family-proxy' };
+          results[i] = res;
+          group.pass1Resolved.push(res.value);
+        } else {
+          results[i] = null;
+          group.unresolvedIndices.push(i);
+        }
+      }
+    }
+
+    for (const group of byProvider.values()) {
+      if (group.pass1Resolved.length > 0) {
+        const sorted = [...group.pass1Resolved].sort((a, b) => a - b);
+        const mid = Math.floor(sorted.length / 2);
+        const medianVal = (sorted.length % 2 === 1)
+          ? sorted[mid]
+          : (sorted[mid - 1] + sorted[mid]) / 2;
+
+        for (const idx of group.unresolvedIndices) {
+          results[idx] = { value: medianVal, provenance: 'median' };
+        }
+      } else {
+        for (const idx of group.unresolvedIndices) {
+          results[idx] = { value: 0, provenance: 'empty' };
+        }
+      }
+    }
+
+    return results;
   }
 
   /** True when the family-specific weekly bucket that governs `model` is spent.
@@ -1249,6 +1451,69 @@ export class AccountManager {
   }
 
   /**
+   * The available account that would preempt `current` under the balanced
+   * margin rule, or null. Active only when routingStrategy is 'balanced'.
+   *
+   * Moves the cursor to the best available candidate when that candidate's
+   * weekly utilization W is lower than current's by at least weeklyBalanceMargin,
+   * subject to priority bounds and two spill guards (target 5h < 0.90, not paused).
+   * Priority preemption is checked before this in _select because operator
+   * priority is explicit intent that beats the margin.
+   *
+   * Cycle-freedom proof (adapted from balanced/src/account-manager.js:443-447):
+   * In any cycle the total priority change is zero. Preemption edges strictly
+   * decrease priority; margin edges never increase it. Therefore every edge
+   * in a cycle must be a same-priority margin move. Each such move descends W
+   * by at least the margin, so the cycle's total W change is strictly negative
+   * — a contradiction. Hence no cycle.
+   *
+   * Preconditions for the proof to hold (design D4 [R1]):
+   * 1. weeklyBalanceMargin >= 0.02 > 0 strictly (clamps prevent 0, which would
+   *    admit A->B->A flapping).
+   * 2. W is frozen within a decision: computed once via _computeAllW() and threaded
+   *    via `allW` rather than recomputed per comparison.
+   * 3. W is model-independent (provider-partitioned weekly metric, not model-dependent).
+   * 4. Priority terms stay `<` for preemption and `<=` for margin moves — an account
+   *    with strictly lower priority (higher numerical value) is never taken on the margin.
+   * 5. _switchOnSessionReset is disabled under balanced (T3), preventing out-of-band
+   *    re-ranking moves on equal W or small W differences that would violate the descent.
+   */
+  _marginPreemptedBy(current, model = null, advisorModel = null, exclude = null, allW = null, { count = true } = {}) {
+    if (!current || this.routingStrategy !== 'balanced') return null;
+
+    const best = this._pickBestAvailable(exclude, model, advisorModel);
+    if (!best || best.index === current.index) {
+      if (count) this.marginMove.self_best++;
+      return null;
+    }
+
+    if ((best.priority || 0) > (current.priority || 0)) return null;
+
+    const W = allW || this._computeAllW();
+    const wCurrent = W[current.index]?.value ?? 0;
+    const wBest = W[best.index]?.value ?? 0;
+    if (wCurrent - wBest < this.weeklyBalanceMargin - MARGIN_FLOAT_EPSILON) {
+      if (count) this.marginMove.below_margin++;
+      return null;
+    }
+
+    const unified5hOk = best.quota?.unified5h == null || best.quota.unified5h < 0.90;
+    if (!unified5hOk) {
+      if (count) this.marginMove.blocked_5h++;
+      return null;
+    }
+
+    const notPaused = !best.pausedUntil || Date.now() >= best.pausedUntil;
+    if (!notPaused) {
+      if (count) this.marginMove.blocked_paused++;
+      return null;
+    }
+
+    if (count) this.marginMove.done++;
+    return best;
+  }
+
+  /**
    * Whether a request right now would actually route to an account, with a short
    * reason when it would not. A caller that records a manual choice (the control
    * plane's switch endpoint) needs to report whether that choice will take
@@ -1276,6 +1541,17 @@ export class AccountManager {
     const preemptor = this._preemptedBy(account);
     if (preemptor) {
       return { eligible: false, reason: `outranked by higher-priority account "${preemptor.name}"` };
+    }
+    // Under balanced routing, an account outranked on weekly balance by >= weeklyBalanceMargin
+    // is rotated off by selection on the very next request (see _marginPreemptedBy).
+    // Phrased to read correctly after "<name> is ...", e.g. "outranked on weekly balance by ...".
+    // Pass { count: false } so this read-only query does not mutate marginMove counters.
+    // Partition by provider: exclude accounts belonging to other providers so that W is
+    // never compared cross-provider (design Q1).
+    const providerExclude = this._excludeOtherProviders(null, providerOf(account));
+    const marginPreemptor = this._marginPreemptedBy(account, null, null, providerExclude, null, { count: false });
+    if (marginPreemptor) {
+      return { eligible: false, reason: `outranked on weekly balance by "${marginPreemptor.name}"` };
     }
     return { eligible: true };
   }
@@ -1355,7 +1631,10 @@ export class AccountManager {
       // for a warm cache priced on the window the account had when it started
       // and is otherwise unbounded: an active session renews its own idle
       // window. Breaking hands the session to the ordinary walk, which aims.
-      if (this.expiryRouting.enabled && this.expiryRouting.preempt
+      // Gated on strategy === 'expiry': under balanced, margin preemption already
+      // pulls traffic toward rolled accounts and rollover preemption does not belong.
+      // Otherwise a draining session under balanced loses its warm cache on roll.
+      if (this.routingStrategy === 'expiry' && this.expiryRouting.enabled && this.expiryRouting.preempt
           && this._pinRolledOver(sessionId, pinned, model)) break;
       // Mirror _select's priority preemption, as _selectForSession does.
       const betterExists = this.accounts.some(a =>
@@ -1581,8 +1860,49 @@ export class AccountManager {
    * `candidates`. With the knob off the term is absent for every account, so it
    * is inert rather than special-cased: the disabled path is the plain term
    * order and not a branch someone has to keep correct.
+   *
+   * Strategy dispatch:
+   * - 'expiry': headroom per second until window resets, sorted ascending
+   *   (higher pressure = more negative rank). Inert when expiryRouting.enabled is off.
+   * - 'drain': inert path across the fleet, regardless of expiryRouting.enabled.
+   * - 'balanced': raw governing window utilization, ascending (lower utilization
+   *   sorts first). An account with unknown (null) or non-finite utilization
+   *   ranks at the median of known candidate utilizations (design D3) so it is
+   *   neither preferentially drained nor completely starved. If no candidate has
+   *   a known utilization, all candidates receive constant 0 so the term is inert.
+   *   Under balanced, this must NEVER return -Infinity.
+   *
+   * NOTE: This median is over model-scoped candidate utilizations. It is a
+   * DIFFERENT median from the one _computeAllW computes in task T4
+   * (model-independent, per-provider, over the whole fleet). Do not unify
+   * them: ranking needs model-scoped window utilization to preserve family
+   * quota, whereas margin moves evaluate fleet-wide provider balance.
    */
   _rankedPressures(candidates, model, now) {
+    if (this.routingStrategy === 'drain') {
+      return candidates.map(() => pressureRank({ kind: 'absent', reason: 'expiry-routing-off' }));
+    }
+    if (this.routingStrategy === 'balanced') {
+      const known = [];
+      for (const a of candidates) {
+        const u = this._governingWindow(a, model).utilization;
+        if (typeof u === 'number' && Number.isFinite(u)) {
+          known.push(u);
+        }
+      }
+      let fallbackMedian = 0;
+      if (known.length > 0) {
+        const sorted = [...known].sort((a, b) => a - b);
+        const mid = Math.floor(sorted.length / 2);
+        fallbackMedian = sorted.length % 2 === 1
+          ? sorted[mid]
+          : (sorted[mid - 1] + sorted[mid]) / 2;
+      }
+      return candidates.map(a => {
+        const u = this._governingWindow(a, model).utilization;
+        return (typeof u === 'number' && Number.isFinite(u)) ? u : fallbackMedian;
+      });
+    }
     if (!this.expiryRouting.enabled) {
       return candidates.map(() => pressureRank({ kind: 'absent', reason: 'expiry-routing-off' }));
     }
@@ -1599,7 +1919,23 @@ export class AccountManager {
    * discoverable, and an account with no reading at all is never held off.
    */
   _belowBandFloor(candidates, model, now) {
-    if (!this.expiryRouting.enabled) return candidates.map(() => 0);
+    if (this.routingStrategy === 'balanced') {
+      if (!candidates || candidates.length === 0) return [];
+      // Under balanced routing, heldOff acts as the weekly balance guard in
+      // _pickLeastLoaded (design D6 [R1]). It sits before load terms so that load
+      // cannot override weekly balance: an account more than weeklyBalanceMargin
+      // above the cheapest candidate is held off (1), even if it has fewer
+      // active sessions. min(W) is strictly over the CANDIDATE SET, not the fleet
+      // (design O1 corollary), preserving provider partitioning and candidate scoping.
+      // W is computed once here per _pickLeastLoaded call.
+      const allW = this._computeAllW();
+      const candidateW = candidates.map(a => allW[a.index]?.value ?? 0);
+      const minW = Math.min(...candidateW);
+      return candidateW.map(w => (w - minW >= this.weeklyBalanceMargin - MARGIN_FLOAT_EPSILON ? 1 : 0));
+    }
+    // The band floor is an expiry-pressure concept. Non-expiry strategies
+    // (e.g. drain) return all-zeros (nothing held off).
+    if (this.routingStrategy !== 'expiry' || !this.expiryRouting.enabled) return candidates.map(() => 0);
     const snapshot = this._bandSnapshot(candidates, model, now);
     const decision = decideBand(snapshot);
     const bounds = snapshot.accounts.map(a => {
@@ -1639,6 +1975,12 @@ export class AccountManager {
    * known here", never "resets at the epoch".
    */
   _rankingReset(account, model) {
+    // Under balanced, rank and tiebreak must read the SAME window pair;
+    // otherwise balanced would rank on a possibly-scoped bucket's utilization
+    // while tie-breaking on the named bucket's reset (two different clocks).
+    if (this.routingStrategy === 'balanced') {
+      return this._governingWindow(account, model).resetAt ?? null;
+    }
     if (!this.expiryRouting.enabled) return this._governingWeeklyReset(account, model);
     return this._governingWindow(account, model).resetAt ?? null;
   }
@@ -1685,7 +2027,11 @@ export class AccountManager {
   _bandSnapshot(candidates, model, now) {
     return {
       now,
-      enabled: !!this.expiryRouting.enabled,
+      // Banding is an expiry-pressure mechanism (decideBand calls pressureOf
+      // internally). Under 'balanced' and 'drain', banding is disabled and
+      // candidate sets pass through intact; otherwise balanced would merely
+      // reorder within an expiry-chosen band (the R1 blocker).
+      enabled: this.routingStrategy === 'expiry' && !!this.expiryRouting.enabled,
       tolerance: this.expiryRouting.tolerance,
       accounts: candidates.map(a => {
         const { utilization: used, resetAt: reset } = this._governingWindow(a, model);
@@ -2256,6 +2602,18 @@ export class AccountManager {
    * account's weekly limit and the account still has weekly quota to spend.
    */
   _switchOnSessionReset(candidates, model = null) {
+    // Under 'balanced', disabled: its trigger is expiry-semantic — "weekly resets
+    // sooner", and its own log line says so. Its rank guard is '>' (if
+    // rankOf.get(best.index) > rankOf.get(current.index) return;), so it moves
+    // the cursor on equal W. And its band-membership guard is skipped when
+    // expiryRouting.enabled is false. Now that T2 made _rankedPressures dispatch
+    // on strategy, this function would rank by balanced pressure and move the
+    // cursor behind the margin's back, outside the cycle-freedom proof. A margin
+    // guard would restore the proof, but the function is redundant under
+    // balanced — the next request's _marginPreemptedBy (task T5) moves the
+    // cursor anyway. Disabling is the smallest correct change.
+    if (this.routingStrategy === 'balanced') return;
+
     const current = this.accounts[this.currentIndex];
     // Need a known weekly reset on the current account to compare against;
     // if it is unknown we are still probing it, so leave it alone. Read through
@@ -2465,8 +2823,12 @@ export class AccountManager {
     return best;
   }
 
-  _selectNext(exclude = null, model = null, advisorModel = null) {
-    const best = this._pickBestAvailable(exclude, model, advisorModel);
+  _selectNext(exclude = null, model = null, advisorModel = null, preselected = null) {
+    // When a caller has already tested and selected a candidate (such as margin
+    // preemption in _select), preselected is accepted directly so an intervening
+    // state change (e.g. throttle expiring between preemption check and cursor move)
+    // cannot divert the cursor onto an account with an untested W gap (D4 precondition 4).
+    const best = preselected ?? this._pickBestAvailable(exclude, model, advisorModel);
     if (best) {
       const previous = this._previousCursor(model, advisorModel);
       const switched = previous != null && previous !== best.index;
@@ -3092,6 +3454,50 @@ export class AccountManager {
   }
 
   /**
+   * Current max(W) - min(W) per provider (design D8 and [O1] corollary).
+   *
+   * Why per-provider:
+   * A cheap Codex fleet (e.g. W in [0.05, 0.08]) alongside a busy Anthropic fleet
+   * (e.g. W in [0.11, 0.64]) would manufacture an artificial cross-fleet spread of
+   * 0.64 - 0.05 = 0.59 that would page continuously even when each provider's
+   * individual fleet is completely balanced. The divergence alert condition
+   * (spread >= margin sustained > 2 h with zero rank moves) must evaluate within
+   * provider to monitor genuine unbalanced capacity.
+   *
+   * @param {Array<{ value: number, provenance: string }>} [allW]
+   * @returns {Record<string, number>}
+   */
+  _weeklySpreadByProvider(allW = null) {
+    const W = allW || this._computeAllW();
+    const byProvider = new Map();
+
+    for (let i = 0; i < this.accounts.length; i++) {
+      const acc = this.accounts[i];
+      const provider = providerOf(acc);
+      const wVal = W[i]?.value;
+      if (wVal == null) continue;
+      let list = byProvider.get(provider);
+      if (!list) {
+        list = [];
+        byProvider.set(provider, list);
+      }
+      list.push(wVal);
+    }
+
+    const spreads = {};
+    for (const [provider, values] of byProvider.entries()) {
+      if (values.length === 0) {
+        spreads[provider] = 0;
+      } else {
+        const max = Math.max(...values);
+        const min = Math.min(...values);
+        spreads[provider] = Math.round((max - min) * 1e12) / 1e12;
+      }
+    }
+    return spreads;
+  }
+
+  /**
    * Return a status summary of all accounts (safe to expose, no credentials).
    */
   // `sessionDetail` adds the per-session `sessions.items` array. Off unless the
@@ -3106,6 +3512,7 @@ export class AccountManager {
     // precisely because it trusts the server to have done this (#237).
     this.sweepExpiredQuotas();
     const sessions = this.sessionTracker.stats(undefined, { detail: sessionDetail });
+    const allW = this._computeAllW();
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
       // Where a request no route claims lands right now — the same derivation
@@ -3117,12 +3524,16 @@ export class AccountManager {
       // per-bucket values rather than only the representative number.
       switchThresholds: typeof this.switchThreshold === 'object' && this.switchThreshold
         ? { ...this.switchThreshold } : null,
+      routingStrategy: this.routingStrategy,
+      weeklyBalanceMargin: this.weeklyBalanceMargin,
       // The knob as the server resolved it, defaults and clamps applied, so an
       // operator reading status sees the configuration the router is using.
       expiryRouting: { ...this.expiryRouting },
       routes: this.getRoutes(),
       sessions: { ...sessions, distribute: this.distributeSessions, draining: this.drainingCount() },
-      accounts: this.accounts.map(a => ({
+      marginMove: { ...this.marginMove },
+      spread: this._weeklySpreadByProvider(allW),
+      accounts: this.accounts.map((a, i) => ({
         name: a.name,
         type: a.type,
         orgName: a.orgName || null,
@@ -3138,8 +3549,12 @@ export class AccountManager {
         // Shared-weekly pressure (model-agnostic), so the ordering the router
         // works from can be read off the payload. Computed whether or not the
         // knob is on: a measurement of the fleet, not a report of the feature's
-        // state.
+        // state. Note: this publishes true *expiry* pressure even under balanced
+        // routing (_pressureVariant does not consult strategy). Labeled with
+        // pressureType so a reader cannot mistake it for the ranking actually in use.
         pressure: this._expiryPressure(a),
+        pressureType: 'expiry',
+        W: allW[i] ? { value: allW[i].value, provenance: allW[i].provenance } : null,
         quota: { ...a.quota },
         // `byBucket` is the one nested value under `usage`, so the shallow copy
         // that covers every flat counter beside it would hand the caller a live

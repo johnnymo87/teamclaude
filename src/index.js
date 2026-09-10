@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { createWriteStream } from 'node:fs';
 import net from 'node:net';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
+import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState, validateRoutingConfig } from './config.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, DEFAULT_SWITCH_THRESHOLD } from './account-manager.js';
 import { createProxyServer } from './server.js';
@@ -246,8 +246,24 @@ async function serverCommand() {
     console.error(`[TeamClaude] Deprecated: account "${acct.name}" uses "models" — replace it with a routes entry: ${JSON.stringify(route)}`);
   }
 
+  // Validate routingStrategy and its dependencies (e.g. quota probing under balanced).
+  // A fatal error here exits immediately with code 1, reporting the configuration problem.
+  try {
+    validateRoutingConfig(config);
+  } catch (err) {
+    console.error(`[TeamClaude] Fatal: ${err.message}`);
+    process.exit(1);
+  }
+
   const threshold = config.switchThreshold || 0.98;
-  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting });
+  const accountManager = new AccountManager(accounts, threshold, {
+    routes: config.routes,
+    ramp: config.stormRamp,
+    distributeSessions: config.distributeSessions,
+    expiryRouting: config.expiryRouting,
+    routingStrategy: config.routingStrategy,
+    weeklyBalanceMargin: config.weeklyBalanceMargin,
+  });
   // Names the activity log's session column from Claude Code's own on-disk
   // session titles. Built whether or not the TUI runs, so a reload has one
   // object to reconfigure.
@@ -344,6 +360,9 @@ async function serverCommand() {
   const reloadAccounts = async () => {
     const diskConfig = await loadConfig();
     if (!diskConfig) return 0;
+    if (diskConfig.routingStrategy && diskConfig.routingStrategy !== accountManager.routingStrategy) {
+      console.log('[TeamClaude] routingStrategy change requires a restart');
+    }
     const added = await syncAccountsFromDisk(diskConfig, config, accountManager);
     // Pick up client-key edits (proxy.clientKeys is read live by both auth
     // gates through the shared config object, so refreshing it here is all a
@@ -570,6 +589,10 @@ async function serverCommand() {
       // the server. Silently going direct is right; saying nothing is not.
       console.log(`[TeamClaude] Upstream proxy: direct — ${describeSelfProxy(egressProxy)}`);
     }
+    // Log the resolved routing strategy and expiry routing state. They are
+    // orthogonal switches, not a precedence (design D1): every combination
+    // is live, so the operator needs to see which combination is active.
+    console.log(`[TeamClaude] Routing: strategy=${accountManager.routingStrategy}, expiryRouting.enabled=${accountManager.expiryRouting.enabled}`);
     if (tui) {
       tui.start();
       console.log(`Listening on port ${port} with ${accounts.length} account(s)`);
@@ -583,6 +606,7 @@ async function serverCommand() {
       console.log(`  Accounts:   ${accounts.length}`);
       console.log(`  Threshold:  ${(threshold * 100).toFixed(0)}%`);
       console.log(`  Upstream:   ${config.upstream || 'https://api.anthropic.com'}`);
+      console.log(`  Strategy:   ${accountManager.routingStrategy} (expiryRouting: ${accountManager.expiryRouting.enabled ? 'on' : 'off'})`);
       console.log('');
       accounts.forEach((a, i) => {
         console.log(`  [${i + 1}] ${a.name} (${a.type})`);

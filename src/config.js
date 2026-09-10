@@ -49,6 +49,39 @@ export async function saveState(state) {
   await chmod(path, 0o600).catch(() => {});
 }
 
+export const VALID_ROUTING_STRATEGIES = ['expiry', 'balanced', 'drain'];
+
+/**
+ * Validates routing-related settings from config.
+ *
+ * `routingStrategy` decides which pressure function ranks accounts (issue #176).
+ * An unrecognised string must fail loudly at startup to prevent an operator typo
+ * silently falling back to expiry behaviour. Under 'balanced', periodic quota
+ * probing is mandatory because ranking by utilization removes drain's "unknown
+ * weekly ranks first" discovery pressure; without a prober, unprobed quotas
+ * never update and balanced rotation stalls.
+ */
+export function validateRoutingConfig(config = {}) {
+  const strategy = config?.routingStrategy === undefined ? 'expiry' : config.routingStrategy;
+  if (!VALID_ROUTING_STRATEGIES.includes(strategy)) {
+    throw new Error(
+      `Invalid "routingStrategy": "${strategy}". Valid strategies are: ${VALID_ROUTING_STRATEGIES.join(', ')}`
+    );
+  }
+  if (strategy === 'balanced') {
+    if (!(config.quotaProbeSeconds > 0)) {
+      throw new Error(
+        '"balanced" routing strategy requires "quotaProbeSeconds" > 0.\n' +
+        'Under balanced routing, ranking by utilization removes drain\'s "unknown weekly ranks first" discovery pressure, ' +
+        'so the periodic prober is the only mechanism that learns account quotas. Set "quotaProbeSeconds" (e.g. 60) in config.'
+      );
+    }
+  }
+  return {
+    routingStrategy: strategy,
+  };
+}
+
 export function createDefaultConfig() {
   return {
     proxy: {
@@ -60,6 +93,8 @@ export function createDefaultConfig() {
     holdSeconds: 0,
     distributeSessions: false,
     sessionTitles: { enabled: false, width: 18 },
+    routingStrategy: 'expiry',
+    weeklyBalanceMargin: 0.10,
     eventLogging: 'hide',
     blockedModels: [],
     accounts: [],
