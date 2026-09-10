@@ -508,3 +508,287 @@ test('under expiry and drain strategies, session-quota reset behaviour is unchan
     'drain strategy must still switch to account whose weekly expires sooner',
   );
 });
+
+// ---------------------------------------------------------------------------
+// 10. Margin preemption (_marginPreemptedBy) and cycle-freedom (D4, D5)
+// ---------------------------------------------------------------------------
+
+test('margin preemption: fires when W(current) - W(best) >= margin, does NOT fire at margin - epsilon, DOES fire at exact margin', () => {
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98, {
+    routingStrategy: 'balanced',
+    weeklyBalanceMargin: 0.10,
+  });
+  const [a] = am.accounts;
+  am.currentIndex = 0; // a is current
+
+  // wBest = 0.15
+  bucket(am, 1, 'unified7d', 0.15, 50);
+
+  // 1. margin - epsilon (0.249 - 0.15 = 0.099 < 0.10): must NOT fire
+  bucket(am, 0, 'unified7d', 0.249, 50);
+  assert.equal(
+    am._marginPreemptedBy(a),
+    null,
+    '_marginPreemptedBy must return null when W diff < margin',
+  );
+  let selected = am.getActiveAccount();
+  assert.equal(selected.name, 'a', 'selection must stay on current when W diff < margin');
+  assert.equal(am.currentIndex, 0);
+
+  // 2. exact margin (0.25 - 0.15 = 0.10 >= 0.10): MUST fire
+  bucket(am, 0, 'unified7d', 0.25, 50);
+  const preemptor = am._marginPreemptedBy(a);
+  assert.equal(preemptor?.name, 'b', '_marginPreemptedBy MUST return best at exact margin boundary');
+  selected = am.getActiveAccount();
+  assert.equal(selected.name, 'b', 'selection MUST switch to best at exact margin boundary');
+  assert.equal(am.currentIndex, 1);
+
+  // 3. strictly above margin (0.35 - 0.15 = 0.20 >= 0.10): MUST fire
+  am.currentIndex = 0;
+  bucket(am, 0, 'unified7d', 0.35, 50);
+  assert.equal(am._marginPreemptedBy(a)?.name, 'b');
+  selected = am.getActiveAccount();
+  assert.equal(selected.name, 'b');
+  assert.equal(am.currentIndex, 1);
+});
+
+test('spill guards: unified5h >= 0.90 and pausedUntil in future independently block margin move; cleared guards allow it', () => {
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98, {
+    routingStrategy: 'balanced',
+    weeklyBalanceMargin: 0.10,
+  });
+  const [a, b] = am.accounts;
+  am.currentIndex = 0; // a is current
+  bucket(am, 0, 'unified7d', 0.60, 50);
+  bucket(am, 1, 'unified7d', 0.10, 50); // W diff = 0.50 >= 0.10
+
+  // Guard 1: unified5h = 0.95 (>= 0.90) blocks
+  b.quota.unified5h = 0.95;
+  b.pausedUntil = null;
+  assert.equal(
+    am._marginPreemptedBy(a),
+    null,
+    'unified5h >= 0.90 must block margin preemption',
+  );
+  assert.equal(am.getActiveAccount().name, 'a', 'selection must stay on a when unified5h blocks');
+  assert.equal(am.currentIndex, 0);
+
+  // Clear Guard 1: unified5h = 0.89 (< 0.90) -> move happens
+  b.quota.unified5h = 0.89;
+  assert.equal(
+    am._marginPreemptedBy(a)?.name,
+    'b',
+    'clearing unified5h guard must allow margin preemption',
+  );
+  assert.equal(am.getActiveAccount().name, 'b');
+  assert.equal(am.currentIndex, 1);
+
+  // Guard 2: pausedUntil in future blocks
+  am.currentIndex = 0;
+  b.quota.unified5h = 0.10;
+  b.pausedUntil = Date.now() + 60_000;
+  assert.equal(
+    am._marginPreemptedBy(a),
+    null,
+    'pausedUntil in future must block margin preemption',
+  );
+  assert.equal(am.getActiveAccount().name, 'a', 'selection must stay on a when pausedUntil blocks');
+  assert.equal(am.currentIndex, 0);
+
+  // Clear Guard 2: pausedUntil = null -> move happens
+  b.pausedUntil = null;
+  assert.equal(
+    am._marginPreemptedBy(a)?.name,
+    'b',
+    'clearing pausedUntil guard must allow margin preemption',
+  );
+  assert.equal(am.getActiveAccount().name, 'b');
+  assert.equal(am.currentIndex, 1);
+});
+
+test('priority interaction: strictly higher-priority preempts regardless of margin; strictly lower-priority never taken on margin even with huge W gap', () => {
+  // Part A: higher-priority (lower priority number) preempts regardless of margin
+  const amHigher = new AccountManager([oauth('a', { priority: 1 }), oauth('b', { priority: 0 })], 0.98, {
+    routingStrategy: 'balanced',
+    weeklyBalanceMargin: 0.10,
+  });
+  amHigher.currentIndex = 0;
+  bucket(amHigher, 0, 'unified7d', 0.20, 50);
+  bucket(amHigher, 1, 'unified7d', 0.20, 50); // W diff = 0 < 0.10 (no margin move)
+
+  assert.equal(
+    amHigher._marginPreemptedBy(amHigher.accounts[0]),
+    null,
+    'margin preemption does not fire when W diff is zero',
+  );
+  assert.equal(
+    amHigher._preemptedBy(amHigher.accounts[0])?.name,
+    'b',
+    'priority preemption must fire because b has higher priority (0 < 1)',
+  );
+  assert.equal(
+    amHigher.getActiveAccount().name,
+    'b',
+    'selection must route to b by priority preemption',
+  );
+  assert.equal(amHigher.currentIndex, 1);
+
+  // Part B: strictly lower-priority (higher priority number) is NEVER taken on margin even with huge W gap
+  const amLower = new AccountManager([oauth('a', { priority: 0 }), oauth('b', { priority: 1 })], 0.98, {
+    routingStrategy: 'balanced',
+    weeklyBalanceMargin: 0.10,
+  });
+  amLower.currentIndex = 0;
+  bucket(amLower, 0, 'unified7d', 0.95, 50);
+  bucket(amLower, 1, 'unified7d', 0.05, 50); // W diff = 0.90 >> 0.10
+
+  assert.equal(
+    amLower._preemptedBy(amLower.accounts[0]),
+    null,
+    'b does not priority-preempt a',
+  );
+  assert.equal(
+    amLower._marginPreemptedBy(amLower.accounts[0]),
+    null,
+    'margin preemption must NEVER take a strictly lower-priority account even with huge W gap',
+  );
+  assert.equal(
+    amLower.getActiveAccount().name,
+    'a',
+    'selection must stay on higher-priority current account a',
+  );
+  assert.equal(amLower.currentIndex, 0);
+});
+
+test('_setCurrent is used on margin move: first-sight observation is seeded', () => {
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98, {
+    routingStrategy: 'balanced',
+    weeklyBalanceMargin: 0.10,
+    expiryRouting: { enabled: true, preempt: true },
+  });
+  const [, b] = am.accounts;
+  am.currentIndex = 0;
+  bucket(am, 0, 'unified7d', 0.50, 50);
+  bucket(am, 1, 'unified7d', 0.10, 50);
+  b.quota.unified7dReset = Date.now() + 50 * H;
+
+  // Before margin move, _currentObs has not been seeded for b
+  assert.notEqual(am._currentObs?.idx, 1);
+
+  const selected = am.getActiveAccount();
+  assert.equal(selected.name, 'b');
+  assert.equal(am.currentIndex, 1);
+
+  // Observable consequence of _setCurrent: _firstSightOn ran and seeded _currentObs
+  assert.ok(am._currentObs != null, '_currentObs must be initialized');
+  assert.equal(am._currentObs.idx, 1, '_currentObs.idx must name account b (index 1)');
+  assert.ok(am._currentObs.windows instanceof Map, '_currentObs.windows must be a Map');
+  assert.ok(am._currentObs.windows.size > 0, '_currentObs.windows must contain seeded window baselines');
+});
+
+test('W frozen within a decision: _computeAllW is not recomputed per candidate comparison, and precomputed allW is reused', () => {
+  const am = new AccountManager([oauth('a'), oauth('b'), oauth('c'), oauth('d')], 0.98, {
+    routingStrategy: 'balanced',
+    weeklyBalanceMargin: 0.10,
+  });
+  am.currentIndex = 0;
+  bucket(am, 0, 'unified7d', 0.80, 50);
+  bucket(am, 1, 'unified7d', 0.60, 50);
+  bucket(am, 2, 'unified7d', 0.40, 50);
+  bucket(am, 3, 'unified7d', 0.10, 50);
+
+  let computeCount = 0;
+  const origComputeAllW = am._computeAllW.bind(am);
+  am._computeAllW = () => {
+    computeCount++;
+    return origComputeAllW();
+  };
+
+  // Run selection across 4 candidate accounts
+  const selected = am.getActiveAccount();
+  assert.equal(selected.name, 'd');
+  assert.equal(
+    computeCount,
+    1,
+    '_computeAllW must be called at most once during a selection decision, NOT per candidate comparison',
+  );
+
+  // Pass precomputed allW explicitly to _marginPreemptedBy: _computeAllW must NOT be called
+  computeCount = 0;
+  const precomputedW = origComputeAllW();
+  am.currentIndex = 0;
+  const result = am._marginPreemptedBy(am.accounts[0], null, null, null, precomputedW);
+  assert.equal(result?.name, 'd');
+  assert.equal(
+    computeCount,
+    0,
+    '_computeAllW must not be called when precomputed allW is provided',
+  );
+});
+
+test('steady-state fixpoint: with no quota updates, repeated selections stop moving after at most N moves', () => {
+  // Fleet of N=4 accounts with different utilizations.
+  // Proof bound: in each margin move, the cursor descends W by at least weeklyBalanceMargin >= 0.02.
+  // With no quota updates, W is fixed. A strictly descending sequence on N accounts can visit
+  // each account at most once without repeating. Thus, cursor moves are bounded by N (in fact <= N - 1).
+  const am = new AccountManager([oauth('a'), oauth('b'), oauth('c'), oauth('d')], 0.98, {
+    routingStrategy: 'balanced',
+    weeklyBalanceMargin: 0.10,
+  });
+  const N = am.accounts.length; // 4
+  am.currentIndex = 0;
+  bucket(am, 0, 'unified7d', 0.80, 50);
+  bucket(am, 1, 'unified7d', 0.60, 50);
+  bucket(am, 2, 'unified7d', 0.40, 50);
+  bucket(am, 3, 'unified7d', 0.10, 50);
+
+  let moves = 0;
+  let lastIndex = am.currentIndex;
+  for (let i = 0; i < 20; i++) {
+    const chosen = am.getActiveAccount();
+    if (chosen.index !== lastIndex) {
+      moves++;
+      lastIndex = chosen.index;
+    }
+  }
+
+  assert.ok(
+    moves <= N,
+    `cursor moved ${moves} times, which must be <= N (${N})`,
+  );
+  assert.equal(lastIndex, 3, 'cursor must settle on account d (lowest W)');
+
+  // Fixpoint stability: further selections never move the cursor
+  for (let i = 0; i < 10; i++) {
+    const chosen = am.getActiveAccount();
+    assert.equal(chosen.index, 3, 'cursor must remain parked at fixpoint');
+    assert.equal(am.currentIndex, 3);
+  }
+});
+
+test('expiry and drain strategies are unaffected: _marginPreemptedBy returns null and selection is unchanged', () => {
+  for (const strategy of ['expiry', 'drain']) {
+    const am = new AccountManager([oauth('a'), oauth('b')], 0.98, {
+      routingStrategy: strategy,
+      weeklyBalanceMargin: 0.10,
+    });
+    am.currentIndex = 0;
+    bucket(am, 0, 'unified7d', 0.90, 50);
+    bucket(am, 1, 'unified7d', 0.10, 50); // W diff = 0.80 >> 0.10
+
+    assert.equal(
+      am._marginPreemptedBy(am.accounts[0]),
+      null,
+      `_marginPreemptedBy must return null under ${strategy} strategy`,
+    );
+
+    const selected = am.getActiveAccount();
+    assert.equal(
+      selected.name,
+      'a',
+      `selection must stay on current account under ${strategy} strategy (margin ignored)`,
+    );
+    assert.equal(am.currentIndex, 0);
+  }
+});
+
