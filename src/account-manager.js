@@ -263,12 +263,14 @@ export class AccountManager {
     // - blocked_paused: candidate W had >= margin advantage but candidate is paused.
     // - below_margin: candidate W was not lower than current W by >= weeklyBalanceMargin.
     // - self_best: current account already ranks best or no candidate was available.
+    // - pin_released: session-driven margin preemption released a session pin in _selectForSession.
     this.marginMove = {
       done: 0,
       blocked_5h: 0,
       blocked_paused: 0,
       below_margin: 0,
       self_best: 0,
+      pin_released: 0,
     };
 
     // Sessions still being drained after distribution was turned off (see
@@ -889,12 +891,17 @@ export class AccountManager {
       // most once across candidates to keep W frozen within this decision (D4).
       if (this.routingStrategy === 'balanced') {
         allW ??= this._computeAllW();
-        // Unpin check: pass { count: false } because releasing a pin here falls
-        // through to _pickLeastLoaded (which load-balances on active session counts
-        // rather than necessarily routing to the margin winner) and does not move
-        // the global cursor. Counting in marginMove here would corrupt cursor
-        // observability metrics (D8).
-        if (this._marginPreemptedBy(pinned, model, advisorModel, exclude, allW, { count: false })) continue;
+        // Unpin check: pass { count: false } to _marginPreemptedBy because releasing
+        // a pin here falls through to _pickLeastLoaded (which load-balances on active
+        // session counts rather than necessarily routing to the margin winner) and
+        // does not move the global cursor. Leaving cursor-move keys (done, blocked_5h,
+        // blocked_paused, below_margin, self_best) honest avoids corrupting cursor
+        // observability metrics (D8), while incrementing pin_released allows D8 to
+        // observe session-driven margin activity and avoid false-positive stuck alerts.
+        if (this._marginPreemptedBy(pinned, model, advisorModel, exclude, allW, { count: false })) {
+          this.marginMove.pin_released++;
+          continue;
+        }
       }
       return pinned;
     }
