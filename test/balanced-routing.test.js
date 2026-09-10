@@ -513,6 +513,69 @@ test('under expiry and drain strategies, session-quota reset behaviour is unchan
 // 10. Margin preemption (_marginPreemptedBy) and cycle-freedom (D4, D5)
 // ---------------------------------------------------------------------------
 
+test('margin preemption and heldOff: float boundary at exact margin across IEEE754 representation pairs', () => {
+  const margin = 0.10;
+  const pairs = [
+    [0.25, 0.15],
+    [0.30, 0.20],
+    [0.60, 0.50],
+    [0.97, 0.87],
+    [0.80, 0.70],
+    [0.40, 0.30],
+    [0.70, 0.60],
+    [0.90, 0.80],
+    [0.12, 0.02],
+  ];
+
+  for (const [wCurrent, wBest] of pairs) {
+    const am = new AccountManager([oauth('a'), oauth('b')], 0.98, {
+      routingStrategy: 'balanced',
+      weeklyBalanceMargin: margin,
+    });
+    const [a, b] = am.accounts;
+    am.currentIndex = 0; // a is current
+
+    bucket(am, 1, 'unified7d', wBest, 50);
+
+    // Below margin: 0.01 less than exact margin
+    bucket(am, 0, 'unified7d', Number((wCurrent - 0.01).toFixed(4)), 50);
+    assert.equal(
+      am._marginPreemptedBy(a),
+      null,
+      `_marginPreemptedBy must NOT fire below margin for pair [${(wCurrent - 0.01).toFixed(4)}, ${wBest}]`,
+    );
+    assert.deepEqual(
+      am._belowBandFloor([b, a], null, Date.now()),
+      [0, 0],
+      `_belowBandFloor must NOT hold off below margin for pair [${(wCurrent - 0.01).toFixed(4)}, ${wBest}]`,
+    );
+
+    // Exact margin: MUST fire
+    bucket(am, 0, 'unified7d', wCurrent, 50);
+    const preemptor = am._marginPreemptedBy(a);
+    assert.equal(
+      preemptor?.name,
+      'b',
+      `_marginPreemptedBy MUST fire at exact margin for pair [${wCurrent}, ${wBest}] (diff: ${wCurrent - wBest})`,
+    );
+
+    const selected = am.getActiveAccount();
+    assert.equal(
+      selected.name,
+      'b',
+      `selection MUST switch to best at exact margin for pair [${wCurrent}, ${wBest}]`,
+    );
+
+    // _belowBandFloor balanced branch: candidate with wCurrent is held off (1), wBest is not (0)
+    const heldOff = am._belowBandFloor([b, a], null, Date.now());
+    assert.deepEqual(
+      heldOff,
+      [0, 1],
+      `_belowBandFloor MUST hold off account at exact margin for pair [${wCurrent}, ${wBest}] (diff: ${wCurrent - wBest})`,
+    );
+  }
+});
+
 test('margin preemption: fires when W(current) - W(best) >= margin, does NOT fire at margin - epsilon, DOES fire at exact margin', () => {
   const am = new AccountManager([oauth('a'), oauth('b')], 0.98, {
     routingStrategy: 'balanced',

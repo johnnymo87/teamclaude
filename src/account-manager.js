@@ -28,6 +28,17 @@ const ENTITLEMENT_DENIAL_COOLDOWN_SECONDS = 5 * 60;
 // `default` — the same value the single-number form has always used.
 export const DEFAULT_SWITCH_THRESHOLD = 0.98;
 
+// Upstream quota arrives in 0.01 quanta (e.g. 0.20, 0.30, 0.87, 0.97). In IEEE 754
+// floating-point representation, differences between two exact 0.01 multiples
+// (such as 0.30 - 0.20 = 0.09999999999999998 or 0.97 - 0.87 = 0.09999999999999998)
+// frequently fall infinitesimal amounts below the nominal decimal difference.
+// Without an epsilon tolerance, margin comparisons (diff >= weeklyBalanceMargin)
+// fail at exactly the margin boundary on roughly half of all value pairs, causing
+// margin preemption and held-off floor decisions to fire one quantum late.
+// 1e-9 is vastly smaller than the minimum 0.01 quota quantum and weeklyBalanceMargin
+// clamp (>= 0.02), yet vastly larger than IEEE 754 float roundoff (~1e-16).
+export const MARGIN_FLOAT_EPSILON = 1e-9;
+
 // Quota fields that survive a restart: utilization levels and their reset
 // windows, learned passively from upstream responses. Transient/derived state
 // (probing, requalify, rateLimitedUntil) is intentionally excluded.
@@ -1463,7 +1474,7 @@ export class AccountManager {
     const W = resolvedW || this._computeAllW();
     const wCurrent = W[current.index]?.value ?? 0;
     const wBest = W[best.index]?.value ?? 0;
-    if (wCurrent - wBest < this.weeklyBalanceMargin) {
+    if (wCurrent - wBest < this.weeklyBalanceMargin - MARGIN_FLOAT_EPSILON) {
       if (count) this.marginMove.below_margin++;
       return null;
     }
@@ -1888,7 +1899,7 @@ export class AccountManager {
       const allW = this._computeAllW();
       const candidateW = candidates.map(a => allW[a.index]?.value ?? 0);
       const minW = Math.min(...candidateW);
-      return candidateW.map(w => (w - minW >= this.weeklyBalanceMargin ? 1 : 0));
+      return candidateW.map(w => (w - minW >= this.weeklyBalanceMargin - MARGIN_FLOAT_EPSILON ? 1 : 0));
     }
     // The band floor is an expiry-pressure concept. Non-expiry strategies
     // (e.g. drain) return all-zeros (nothing held off).
