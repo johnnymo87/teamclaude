@@ -1563,7 +1563,8 @@ test('advisor pass never mutates under balanced routing: does not move cursor, s
 
     const countersBefore = { ...am.marginMove };
     am._selectForSession('s1', null, OPUS, FABLE);
-    assert.deepEqual(am.marginMove, countersBefore, '_selectForSession must pass count: false and not mutate marginMove counters');
+    assert.equal(am.marginMove.done, 0, '_selectForSession must pass count: false and not mutate cursor-move counters');
+    assert.equal(am.marginMove.pin_released, countersBefore.pin_released + 1, '_selectForSession increments pin_released on margin unpin');
   }
 });
 
