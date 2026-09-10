@@ -997,6 +997,125 @@ test('previewRouteIndex and session pin preemption behave identically under expi
   }
 });
 
+test('rollover preemption is gated on strategy === "expiry": inert under balanced, active under expiry', () => {
+  const WEEK = 7 * 24 * H;
+
+  // 1. _select under balanced: current account rolls over while ranking best.
+  // Must NOT trigger rollover branch and must NOT log held-rollover spam.
+  {
+    const am = new AccountManager([oauth('a'), oauth('b')], 0.98, {
+      routingStrategy: 'balanced',
+      weeklyBalanceMargin: 0.10,
+      expiryRouting: { enabled: true, preempt: true },
+    });
+    am.currentIndex = 0;
+    bucket(am, 0, 'unified7d', 0.10, 10);
+    bucket(am, 1, 'unified7d', 0.50, 10);
+
+    // Initial serve to seed observation
+    am.getActiveAccount(null, OPUS);
+
+    // Roll window on account 0
+    am.accounts[0].quota.unified7dReset += WEEK;
+
+    const logs = [];
+    const origLog = console.log;
+    console.log = (...args) => logs.push(args.join(' '));
+    try {
+      const selected = am.getActiveAccount(null, OPUS);
+      assert.equal(selected.name, 'a');
+    } finally {
+      console.log = origLog;
+    }
+    assert.equal(
+      logs.some(l => l.includes('rolled over its unified7d window and still ranks best')),
+      false,
+      'under balanced, rolled-over current account must NOT log held-rollover message',
+    );
+  }
+
+  // 2. _selectForSession under balanced: pinned account rolls over while ranking best.
+  // Must NOT release session pin via rollover preemption.
+  {
+    const am = new AccountManager([oauth('a'), oauth('b')], 0.98, {
+      routingStrategy: 'balanced',
+      weeklyBalanceMargin: 0.10,
+      distributeSessions: true,
+      expiryRouting: { enabled: true, preempt: true },
+    });
+    am.currentIndex = 0;
+    bucket(am, 0, 'unified7d', 0.10, 10);
+    bucket(am, 1, 'unified7d', 0.50, 10);
+
+    am.beginSession('s1');
+    am.getActiveAccount(null, OPUS, null, 's1');
+    am.recordSession('s1', 0, OPUS);
+    am.endSession('s1');
+
+    // Roll window on account 0
+    am.accounts[0].quota.unified7dReset += WEEK;
+
+    const logs = [];
+    const origLog = console.log;
+    console.log = (...args) => logs.push(args.join(' '));
+    let selected;
+    try {
+      am.beginSession('s1');
+      selected = am.getActiveAccount(null, OPUS, null, 's1');
+      am.endSession('s1');
+    } finally {
+      console.log = origLog;
+    }
+    assert.equal(selected.name, 'a', 'session pin must stay on a under balanced');
+    assert.equal(
+      logs.some(l => l.includes('weekly window rolled over; re-routing')),
+      false,
+      'under balanced, rolled-over pin must NOT re-route via rollover preemption',
+    );
+  }
+
+  // 3. previewRouteIndex under balanced: current account rolls over, but is within margin of best.
+  // Must NOT treat current as rolled, returning current.index instead of re-ranking to best.
+  {
+    const am = new AccountManager([oauth('a'), oauth('b')], 0.98, {
+      routingStrategy: 'balanced',
+      weeklyBalanceMargin: 0.10,
+      expiryRouting: { enabled: true, preempt: true },
+    });
+    am.currentIndex = 0;
+    bucket(am, 0, 'unified7d', 0.25, 10);
+    bucket(am, 1, 'unified7d', 0.20, 10); // diff 0.05 < margin 0.10 -> within margin
+
+    am.getActiveAccount(null, OPUS);
+    am.accounts[0].quota.unified7dReset += WEEK;
+
+    const preview = am.previewRouteIndex(OPUS);
+    assert.equal(
+      preview,
+      0,
+      'previewRouteIndex under balanced must stay on current (index 0) within margin, ignoring rollover',
+    );
+  }
+
+  // 4. Verification under expiry strategy: rollover preemption IS active.
+  {
+    const am = new AccountManager([oauth('a'), oauth('b')], 0.98, {
+      routingStrategy: 'expiry',
+      expiryRouting: { enabled: true, preempt: true },
+    });
+    am.currentIndex = 0;
+    bucket(am, 0, 'unified7d', 0.40, 10);
+    bucket(am, 1, 'unified7d', 0.40, 10);
+
+    am.getActiveAccount(null, OPUS);
+    am.accounts[0].quota.unified7dReset += WEEK;
+
+    // Under expiry, a rolled over and b has earlier reset, so it switches to b
+    const selected = am.getActiveAccount(null, OPUS);
+    assert.equal(selected.name, 'b', 'under expiry strategy, rollover preemption must switch to b');
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Task B (D6 [R1]): _pickLeastLoaded heldOff seam
 // ---------------------------------------------------------------------------
