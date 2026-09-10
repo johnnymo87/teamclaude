@@ -233,7 +233,7 @@ test('previewRouteIndex calls _marginPreemptedBy with count:false and does NOT i
 
   // Call previewRouteIndex repeatedly (simulating TUI re-render / polling)
   for (let i = 0; i < 20; i++) {
-    const idx = am.previewRouteIndex(null, OPUS);
+    const idx = am.previewRouteIndex(OPUS);
     // Preview correctly predicts account 1 would be picked:
     assert.equal(idx, 1);
   }
@@ -249,7 +249,7 @@ test('previewRouteIndex calls _marginPreemptedBy with count:false and does NOT i
   // Also test preview with 5h wall:
   am.accounts[1].quota.unified5h = 0.95;
   for (let i = 0; i < 10; i++) {
-    am.previewRouteIndex(null, OPUS);
+    am.previewRouteIndex(OPUS);
   }
   assert.deepEqual(am.marginMove, {
     done: 0,
@@ -262,7 +262,7 @@ test('previewRouteIndex calls _marginPreemptedBy with count:false and does NOT i
   am.accounts[1].quota.unified5h = 0.10;
   am.accounts[1].pausedUntil = now + 60_000;
   for (let i = 0; i < 10; i++) {
-    am.previewRouteIndex(null, OPUS);
+    am.previewRouteIndex(OPUS);
   }
   assert.deepEqual(am.marginMove, {
     done: 0,
@@ -275,7 +275,7 @@ test('previewRouteIndex calls _marginPreemptedBy with count:false and does NOT i
   am.accounts[1].pausedUntil = null;
   am.accounts[1].quota.unified7d = 0.75;
   for (let i = 0; i < 10; i++) {
-    am.previewRouteIndex(null, OPUS);
+    am.previewRouteIndex(OPUS);
   }
   assert.deepEqual(am.marginMove, {
     done: 0,
@@ -391,7 +391,7 @@ test("under 'expiry' and 'drain' strategies, fields are present but inert (no co
 
     // Under expiry or drain, run selections:
     am._select(null, OPUS);
-    am.previewRouteIndex(null, OPUS);
+    am.previewRouteIndex(OPUS);
 
     // marginMove counters must remain strictly 0 (inert)
     assert.deepEqual(am.marginMove, {

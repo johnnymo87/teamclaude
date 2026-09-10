@@ -778,7 +778,11 @@ test('priority interaction: strictly higher-priority preempts regardless of marg
   );
   assert.equal(amHigher.currentIndex, 1);
 
-  // Part B: strictly lower-priority (higher priority number) is NEVER taken on margin even with huge W gap
+  // Part B: strictly lower-priority (higher priority number) is NEVER taken on margin even with huge W gap.
+  // Reachability note: from _select, current is available, so _pickBestAvailable ranks priority
+  // first and will return current before any strictly lower-priority account. The explicit priority
+  // guard in _marginPreemptedBy (`(best.priority || 0) > (current.priority || 0)`) is defense-in-depth
+  // guaranteeing D4 precondition 4. We test both the guard in isolation and integrated selection:
   const amLower = new AccountManager([oauth('a', { priority: 0 }), oauth('b', { priority: 1 })], 0.98, {
     routingStrategy: 'balanced',
     weeklyBalanceMargin: 0.10,
@@ -792,6 +796,15 @@ test('priority interaction: strictly higher-priority preempts regardless of marg
     null,
     'b does not priority-preempt a',
   );
+
+  // Unit test of the priority guard in isolation: excluding current forces _pickBestAvailable to pick b (priority 1),
+  // directly exercising the (best.priority > current.priority) check in _marginPreemptedBy.
+  assert.equal(
+    amLower._marginPreemptedBy(amLower.accounts[0], null, null, new Set([0])),
+    null,
+    'unit test of guard in isolation: _marginPreemptedBy rejects best when best.priority > current.priority',
+  );
+
   assert.equal(
     amLower._marginPreemptedBy(amLower.accounts[0]),
     null,
@@ -831,7 +844,10 @@ test('_setCurrent is used on margin move: first-sight observation is seeded', ()
   assert.ok(am._currentObs.windows.size > 0, '_currentObs.windows must contain seeded window baselines');
 });
 
-test('W frozen within a decision: _computeAllW is not recomputed per candidate comparison, and precomputed allW is reused', () => {
+test('W evaluation bound: a selection decision evaluates W a bounded number of times', () => {
+  // A direct _select decision evaluates _computeAllW at most once across all candidates.
+  // Note: if session distribution is active and falls through to placement (_pickLeastLoaded),
+  // _belowBandFloor legitimately computes W a second time with the identical snapshot value.
   const am = new AccountManager([oauth('a'), oauth('b'), oauth('c'), oauth('d')], 0.98, {
     routingStrategy: 'balanced',
     weeklyBalanceMargin: 0.10,
@@ -849,65 +865,87 @@ test('W frozen within a decision: _computeAllW is not recomputed per candidate c
     return origComputeAllW();
   };
 
-  // Run selection across 4 candidate accounts
+  // Run selection across candidate accounts
   const selected = am.getActiveAccount();
   assert.equal(selected.name, 'd');
   assert.equal(
     computeCount,
     1,
-    '_computeAllW must be called at most once during a selection decision, NOT per candidate comparison',
+    'direct selection decision evaluates W exactly once',
   );
 
-  // Pass precomputed allW explicitly to _marginPreemptedBy: _computeAllW must NOT be called
+  // When session placement routes through _pickLeastLoaded, _belowBandFloor computes W again:
   computeCount = 0;
-  const precomputedW = origComputeAllW();
-  am.currentIndex = 0;
-  const result = am._marginPreemptedBy(am.accounts[0], null, null, null, precomputedW);
-  assert.equal(result?.name, 'd');
-  assert.equal(
-    computeCount,
-    0,
-    '_computeAllW must not be called when precomputed allW is provided',
+  const amSession = new AccountManager([oauth('a'), oauth('b')], 0.98, {
+    routingStrategy: 'balanced',
+    weeklyBalanceMargin: 0.10,
+    distributeSessions: true,
+  });
+  bucket(amSession, 0, 'unified7d', 0.50, 50);
+  bucket(amSession, 1, 'unified7d', 0.20, 50);
+  amSession._computeAllW = () => {
+    computeCount++;
+    return origComputeAllW();
+  };
+  amSession.beginSession('new-sess');
+  amSession.getActiveAccount(null, OPUS, null, 'new-sess');
+  amSession.endSession('new-sess');
+  assert.ok(
+    computeCount <= 2,
+    `session placement decision evaluates W at most twice (got ${computeCount})`,
   );
 });
 
-test('steady-state fixpoint: with no quota updates, repeated selections stop moving after at most N moves', () => {
-  // Fleet of N=4 accounts with different utilizations.
-  // Proof bound: in each margin move, the cursor descends W by at least weeklyBalanceMargin >= 0.02.
-  // With no quota updates, W is fixed. A strictly descending sequence on N accounts can visit
-  // each account at most once without repeating. Thus, cursor moves are bounded by N (in fact <= N - 1).
-  const am = new AccountManager([oauth('a'), oauth('b'), oauth('c'), oauth('d')], 0.98, {
+test('steady-state fixpoint: alternating models with opposing utilization settle and do not flap across requests', () => {
+  // A has unified7d: 0.30, unified7dFable: 0.10 -> W(A) = 0.30
+  // B has unified7d: 0.10, unified7dFable: 0.30 -> W(B) = 0.10
+  // Margin = 0.10. W(A) - W(B) = 0.20 >= margin.
+  //
+  // Model-dependent ranking alone would flap indefinitely between models:
+  // - OPUS prefers B (unified7d 0.10 < 0.30)
+  // - FABLE prefers A (unified7dFable 0.10 < 0.30)
+  //
+  // But model-independent W keeps the cursor still once on B:
+  // When cursor is on B and request is FABLE, A ranks best for FABLE,
+  // but W(B) - W(A) = 0.10 - 0.30 = -0.20 < margin, so margin preemption
+  // refuses to move. Cursor settles on B and stays there across alternating requests.
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98, {
     routingStrategy: 'balanced',
     weeklyBalanceMargin: 0.10,
   });
-  const N = am.accounts.length; // 4
-  am.currentIndex = 0;
-  bucket(am, 0, 'unified7d', 0.80, 50);
-  bucket(am, 1, 'unified7d', 0.60, 50);
-  bucket(am, 2, 'unified7d', 0.40, 50);
-  bucket(am, 3, 'unified7d', 0.10, 50);
+  am.currentIndex = 0; // starts on a
+  bucket(am, 0, 'unified7d', 0.30, 50);
+  bucket(am, 0, 'unified7dFable', 0.10, 50);
+  bucket(am, 1, 'unified7d', 0.10, 50);
+  bucket(am, 1, 'unified7dFable', 0.30, 50);
 
+  const models = [OPUS, FABLE];
   let moves = 0;
   let lastIndex = am.currentIndex;
   for (let i = 0; i < 20; i++) {
-    const chosen = am.getActiveAccount();
+    const model = models[i % 2];
+    const chosen = am.getActiveAccount(null, model);
     if (chosen.index !== lastIndex) {
       moves++;
       lastIndex = chosen.index;
     }
   }
 
+  // Must settle in at most 1 move (from a to b on the first OPUS request)
+  // and NEVER flap back to a on subsequent FABLE requests.
   assert.ok(
-    moves <= N,
-    `cursor moved ${moves} times, which must be <= N (${N})`,
+    moves <= 1,
+    `cursor flapped: moved ${moves} times across alternating models (must be <= 1)`,
   );
-  assert.equal(lastIndex, 3, 'cursor must settle on account d (lowest W)');
+  assert.equal(lastIndex, 1, 'cursor must settle on account b (lowest W)');
+  assert.equal(am.currentIndex, 1, 'currentIndex must stay parked on b');
 
-  // Fixpoint stability: further selections never move the cursor
+  // Verify fixpoint stability across 10 further alternating requests:
   for (let i = 0; i < 10; i++) {
-    const chosen = am.getActiveAccount();
-    assert.equal(chosen.index, 3, 'cursor must remain parked at fixpoint');
-    assert.equal(am.currentIndex, 3);
+    const model = models[i % 2];
+    const chosen = am.getActiveAccount(null, model);
+    assert.equal(chosen.name, 'b', `request ${i} for ${model} must stay on b`);
+    assert.equal(am.currentIndex, 1);
   }
 });
 
