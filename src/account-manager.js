@@ -8,6 +8,7 @@ import { SessionTracker } from './session-tracker.js';
 import { buildQuotaSummary } from './quota-summary.js';
 import { ROLLOVER_MIN_JUMP_MS, remapHeld } from './rollover.js';
 import { decideBand, pressureOf, pressureRank, assertNever } from './band-decision.js';
+import { VALID_ROUTING_STRATEGIES } from './config.js';
 
 // Re-exported for callers that import these model helpers from here.
 export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
@@ -197,7 +198,7 @@ function sampleModelFor(route) {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker, expiryRouting } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker, expiryRouting, routingStrategy = 'expiry', weeklyBalanceMargin = 0.10 } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -213,6 +214,28 @@ export class AccountManager {
     // accounts by load instead of funnelling them all onto the current one.
     this.sessionTracker = sessionTracker || new SessionTracker();
     this.distributeSessions = !!distributeSessions;
+    // Routing strategy determines the pressure ranking function ('expiry' | 'balanced' | 'drain').
+    // Default is 'expiry' matching historic deployed behaviour. An unknown value fails loudly.
+    const strategy = routingStrategy === undefined ? 'expiry' : routingStrategy;
+    if (!VALID_ROUTING_STRATEGIES.includes(strategy)) {
+      throw new Error(`Invalid routingStrategy "${strategy}". Must be one of: ${VALID_ROUTING_STRATEGIES.join(', ')}`);
+    }
+    this.routingStrategy = strategy;
+
+    // Hysteresis margin for balanced rotation (design D4 item 1).
+    // The cycle-freedom proof requires margin > 0 strictly; clamping to >= 0
+    // (as the old fork did) admitted A→B→A flapping. Upstream quota updates
+    // arrive in 0.01 quanta, so margins below 0.02 would flap on single-quantum
+    // differences (period ≈ margin / spend-rate), thrashing prompt caches
+    // across live sessions. We clamp to >= 0.02 and warn below 0.05.
+    // Non-finite or absent values fall back to the 0.10 default, matching the
+    // tolerance clamping style at :1486-1488.
+    if (typeof weeklyBalanceMargin === 'number' && Number.isFinite(weeklyBalanceMargin) && weeklyBalanceMargin < 0.05) {
+      console.warn(`[TeamClaude] weeklyBalanceMargin ${weeklyBalanceMargin} is below 0.05; small margins cause frequent rotation and cache thrashing`);
+    }
+    this.weeklyBalanceMargin = typeof weeklyBalanceMargin === 'number' && Number.isFinite(weeklyBalanceMargin)
+      ? Math.max(0.02, weeklyBalanceMargin)
+      : 0.10;
     // Sessions still being drained after distribution was turned off (see
     // setDistributeSessions). null = not draining; a Set of session ids otherwise.
     this._drainingSessions = null;
