@@ -100,6 +100,7 @@ test('marginMove counter increments done on a successful margin preemption move'
     blocked_paused: 0,
     below_margin: 0,
     self_best: 0,
+    pin_released: 0,
   });
 
   // Real selection triggers margin preemption move to candidate 1
@@ -114,6 +115,7 @@ test('marginMove counter increments done on a successful margin preemption move'
     blocked_paused: 0,
     below_margin: 0,
     self_best: 0,
+    pin_released: 0,
   });
 
   // Also exposed on getStatus()
@@ -123,6 +125,7 @@ test('marginMove counter increments done on a successful margin preemption move'
     blocked_paused: 0,
     below_margin: 0,
     self_best: 0,
+    pin_released: 0,
   });
 });
 
@@ -154,6 +157,7 @@ test('marginMove counter increments blocked_5h when best candidate sits at unifi
     blocked_paused: 0,
     below_margin: 0,
     self_best: 0,
+    pin_released: 0,
   });
 });
 
@@ -186,6 +190,7 @@ test('marginMove counter increments blocked_paused when best candidate is paused
     blocked_paused: 1,
     below_margin: 0,
     self_best: 0,
+    pin_released: 0,
   });
 });
 
@@ -217,6 +222,7 @@ test('marginMove counter increments below_margin when W gap is below weeklyBalan
     blocked_paused: 0,
     below_margin: 1,
     self_best: 0,
+    pin_released: 0,
   });
 });
 
@@ -241,6 +247,7 @@ test('marginMove counter increments self_best when current account is already be
     blocked_paused: 0,
     below_margin: 0,
     self_best: 0,
+    pin_released: 0,
   });
 
   // Current account (0) is already best (0.20 < 0.80). Selection stays on current.
@@ -255,6 +262,7 @@ test('marginMove counter increments self_best when current account is already be
     blocked_paused: 0,
     below_margin: 0,
     self_best: 1,
+    pin_released: 0,
   });
 });
 
@@ -285,6 +293,7 @@ test('previewRouteIndex calls _marginPreemptedBy with count:false and does NOT i
     blocked_paused: 0,
     below_margin: 0,
     self_best: 0,
+    pin_released: 0,
   }, 'previewRouteIndex must not increment any marginMove counter');
 
   // Also test preview with 5h wall:
@@ -298,6 +307,7 @@ test('previewRouteIndex calls _marginPreemptedBy with count:false and does NOT i
     blocked_paused: 0,
     below_margin: 0,
     self_best: 0,
+    pin_released: 0,
   }, 'previewRouteIndex with 5h wall must not increment any marginMove counter');
 
   // Also test preview with paused candidate:
@@ -312,6 +322,7 @@ test('previewRouteIndex calls _marginPreemptedBy with count:false and does NOT i
     blocked_paused: 0,
     below_margin: 0,
     self_best: 0,
+    pin_released: 0,
   }, 'previewRouteIndex with paused candidate must not increment any marginMove counter');
 
   // Also test preview with gap below margin:
@@ -326,6 +337,7 @@ test('previewRouteIndex calls _marginPreemptedBy with count:false and does NOT i
     blocked_paused: 0,
     below_margin: 0,
     self_best: 0,
+    pin_released: 0,
   }, 'previewRouteIndex below margin must not increment any marginMove counter');
 
   // In contrast, real selection SHOULD count:
@@ -334,7 +346,7 @@ test('previewRouteIndex calls _marginPreemptedBy with count:false and does NOT i
   assert.equal(am.marginMove.done, 1, 'real selection must increment marginMove.done');
 });
 
-test('_selectForSession does not increment marginMove counters (leaves cursor metrics honest)', () => {
+test('_selectForSession increments pin_released on margin release and does NOT increment done (leaves cursor metrics honest)', () => {
   const am = new AccountManager([oauth('pinned'), oauth('candidate')], 0.98, {
     routingStrategy: 'balanced',
     weeklyBalanceMargin: 0.10,
@@ -350,28 +362,18 @@ test('_selectForSession does not increment marginMove counters (leaves cursor me
   // Pin session to account 0
   am.recordSession('sess-1', 0, OPUS);
 
-  assert.deepEqual(am.marginMove, {
-    done: 0,
-    blocked_5h: 0,
-    blocked_paused: 0,
-    below_margin: 0,
-    self_best: 0,
-  });
+  assert.equal(am.marginMove.pin_released, 0);
 
   // _selectForSession with session 'sess-1' evaluates margin preemption on the pinned account.
   // When the pin is released, the session routes via _pickLeastLoaded.
   // Because destination is chosen by load rather than the margin winner and the global cursor
-  // is not moved, marginMove counters are NOT incremented ({ count: false }), keeping cursor
-  // metrics honest.
+  // is not moved, cursor-move counters (done, blocked_5h, etc.) are NOT incremented,
+  // but pin_released IS incremented so D8 can observe session-driven margin activity.
   const picked = am._selectForSession('sess-1', null, OPUS);
   assert.equal(picked.name, 'candidate');
-  assert.deepEqual(am.marginMove, {
-    done: 0,
-    blocked_5h: 0,
-    blocked_paused: 0,
-    below_margin: 0,
-    self_best: 0,
-  }, '_selectForSession must not mutate marginMove counters');
+  assert.equal(am.marginMove.done, 0, 'session-driven margin release must not increment done');
+  assert.equal(am.marginMove.pin_released, 1, 'session-driven margin release must increment pin_released');
+  assert.equal(am.getStatus().marginMove.pin_released, 1, '/status must expose pin_released');
 });
 
 // ---------------------------------------------------------------------------
@@ -439,6 +441,7 @@ test("under 'expiry' and 'drain' strategies, fields are present but inert (no co
       blocked_paused: 0,
       below_margin: 0,
       self_best: 0,
+      pin_released: 0,
     });
     assert.ok(status.spread);
     assert.deepEqual(status.accounts[0].W, { value: 0.80, provenance: 'unified' });
@@ -455,6 +458,7 @@ test("under 'expiry' and 'drain' strategies, fields are present but inert (no co
       blocked_paused: 0,
       below_margin: 0,
       self_best: 0,
+      pin_released: 0,
     }, `marginMove must remain inert under strategy ${strategy}`);
   }
 });
@@ -492,6 +496,7 @@ test('HTTP GET /teamclaude/status exposes routingStrategy, weeklyBalanceMargin, 
       blocked_paused: 0,
       below_margin: 0,
       self_best: 0,
+      pin_released: 0,
     });
     assert.equal(data.spread.anthropic, 0.60);
     assert.deepEqual(data.accounts[0].W, { value: 0.85, provenance: 'unified' });
