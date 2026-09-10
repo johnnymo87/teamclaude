@@ -763,7 +763,12 @@ export class AccountManager {
       // low-utilization fleets never reach. Every pass reaching here decides the
       // request, the advisor-constrained one included; `allowProbe` gates the
       // exhausted-fleet probe, not which pass is final.
-      const rolled = this.expiryRouting.enabled && this.expiryRouting.preempt
+      // Under balanced, the margin already pulls traffic toward a rolled account
+      // (its W is ~0), so rollover preemption is redundant, and its expiry-semantic
+      // trigger does not belong to this strategy. Firing it under balanced causes
+      // steady-state log spam when the rolled account is best and breaks equal-W
+      // ties on soonest reset rather than respecting weekly balance.
+      const rolled = this.routingStrategy === 'expiry' && this.expiryRouting.enabled && this.expiryRouting.preempt
         && this._currentRolledOver(current, model);
       if (rolled) {
         const next = this._selectNext(exclude, model, advisorModel);
@@ -849,7 +854,9 @@ export class AccountManager {
       // candidate rather than the bucket's pin alone, since a session sitting on
       // another family's account is just as stuck, and a rollover re-ranks so
       // that pressure picks the destination.
-      if (this.expiryRouting.enabled && this.expiryRouting.preempt
+      // Gated on strategy === 'expiry': under balanced, margin preemption already
+      // pulls traffic toward rolled accounts and rollover preemption does not belong.
+      if (this.routingStrategy === 'expiry' && this.expiryRouting.enabled && this.expiryRouting.preempt
           && this._pinRolledOver(sessionId, pinned, model)) {
         const next = this._pickLeastLoaded(exclude, model, advisorModel);
         if (next && next.index !== idx) {
@@ -1016,7 +1023,7 @@ export class AccountManager {
       // available account wins over a healthy current one; same tier stays put.
       const better = this.accounts.some(a =>
         this._isAvailable(a, model) && (a.priority || 0) < (current.priority || 0));
-      const rolled = this.expiryRouting.enabled && this.expiryRouting.preempt
+      const rolled = this.routingStrategy === 'expiry' && this.expiryRouting.enabled && this.expiryRouting.preempt
         && this._currentRolledOver(current, model);
       // Mirror _select's margin preemption (balanced routing): rotate away from
       // current when an available candidate has lower weekly utilization W by at
