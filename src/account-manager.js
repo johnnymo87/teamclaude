@@ -2332,6 +2332,18 @@ export class AccountManager {
    * account's weekly limit and the account still has weekly quota to spend.
    */
   _switchOnSessionReset(candidates, model = null) {
+    // Under 'balanced', disabled: its trigger is expiry-semantic — "weekly resets
+    // sooner", and its own log line says so. Its rank guard is '>' (if
+    // rankOf.get(best.index) > rankOf.get(current.index) return;), so it moves
+    // the cursor on equal W. And its band-membership guard is skipped when
+    // expiryRouting.enabled is false. Now that T2 made _rankedPressures dispatch
+    // on strategy, this function would rank by balanced pressure and move the
+    // cursor behind the margin's back, outside the cycle-freedom proof. A margin
+    // guard would restore the proof, but the function is redundant under
+    // balanced — the next request's _marginPreemptedBy (task T5) moves the
+    // cursor anyway. Disabling is the smallest correct change.
+    if (this.routingStrategy === 'balanced') return;
+
     const current = this.accounts[this.currentIndex];
     // Need a known weekly reset on the current account to compare against;
     // if it is unknown we are still probing it, so leave it alone. Read through

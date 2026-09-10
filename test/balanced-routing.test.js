@@ -407,3 +407,104 @@ test('belowBandFloor returns all zeros under balanced and drain even with expiry
     'drain strategy makes _belowBandFloor inert (all zeros)',
   );
 });
+
+// ---------------------------------------------------------------------------
+// 9. Disable _switchOnSessionReset under balanced (D4 [R1])
+// ---------------------------------------------------------------------------
+
+test('under balanced strategy, session-quota reset does NOT move currentIndex even when another account weekly resets sooner and ranks equal-or-better', () => {
+  const now = Date.now();
+
+  function makeFleet(strategy, aUtil = 0.2, bUtil = 0.5) {
+    const am = new AccountManager([oauth('a'), oauth('b')], 0.98, {
+      routingStrategy: strategy,
+    });
+    const [a, b] = am.accounts;
+    // a has rolled 5h window (just reset), weekly expires soon (6h)
+    a.quota.unified5h = 0.99;
+    a.quota.unified5hReset = now - 1000;
+    a.quota.unified7d = aUtil;
+    a.quota.unified7dReset = now + 6 * H;
+    a.probing = false;
+
+    // b is current, weekly expires much later (58h)
+    b.quota.unified5h = 0.2;
+    b.quota.unified5hReset = now + 4 * H;
+    b.quota.unified7d = bUtil;
+    b.quota.unified7dReset = now + 58 * H;
+    b.probing = false;
+
+    am.currentIndex = 1; // current = b
+    return am;
+  }
+
+  // 1. Better rank: a has lower utilization (0.1 vs 0.5)
+  const amBetter = makeFleet('balanced', 0.1, 0.5);
+  amBetter.refreshExpiredQuotas();
+  assert.equal(
+    amBetter.currentIndex,
+    1,
+    'balanced strategy must not move currentIndex on session reset even when candidate has better rank',
+  );
+
+  // 2. Equal rank: a has equal utilization (0.2 vs 0.2)
+  const amEqual = makeFleet('balanced', 0.2, 0.2);
+  amEqual.refreshExpiredQuotas();
+  assert.equal(
+    amEqual.currentIndex,
+    1,
+    'balanced strategy must not move currentIndex on session reset even when candidate has equal rank',
+  );
+
+  // 3. Direct call to _switchOnSessionReset is also early-returned
+  const amDirect = makeFleet('balanced', 0.1, 0.5);
+  amDirect._switchOnSessionReset([amDirect.accounts[0]]);
+  assert.equal(
+    amDirect.currentIndex,
+    1,
+    '_switchOnSessionReset must early-return under balanced',
+  );
+});
+
+test('under expiry and drain strategies, session-quota reset behaviour is unchanged', () => {
+  const now = Date.now();
+
+  function makeFleet(strategy, aUtil = 0.2, bUtil = 0.5) {
+    const am = new AccountManager([oauth('a'), oauth('b')], 0.98, {
+      routingStrategy: strategy,
+    });
+    const [a, b] = am.accounts;
+    a.quota.unified5h = 0.99;
+    a.quota.unified5hReset = now - 1000;
+    a.quota.unified7d = aUtil;
+    a.quota.unified7dReset = now + 6 * H;
+    a.probing = false;
+
+    b.quota.unified5h = 0.2;
+    b.quota.unified5hReset = now + 4 * H;
+    b.quota.unified7d = bUtil;
+    b.quota.unified7dReset = now + 58 * H;
+    b.probing = false;
+
+    am.currentIndex = 1;
+    return am;
+  }
+
+  // Under expiry strategy: switches to a
+  const amExpiry = makeFleet('expiry', 0.2, 0.2);
+  amExpiry.refreshExpiredQuotas();
+  assert.equal(
+    amExpiry.currentIndex,
+    0,
+    'expiry strategy must still switch to account whose weekly expires sooner',
+  );
+
+  // Under drain strategy: switches to a
+  const amDrain = makeFleet('drain', 0.2, 0.2);
+  amDrain.refreshExpiredQuotas();
+  assert.equal(
+    amDrain.currentIndex,
+    0,
+    'drain strategy must still switch to account whose weekly expires sooner',
+  );
+});
