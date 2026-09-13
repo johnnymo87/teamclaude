@@ -1483,7 +1483,7 @@ export class AccountManager {
       // no ramp started, and no counters incremented ({ count: false }) — otherwise
       // marginMove would measure the TUI's poll/refresh rate rather than routing decisions.
       const marginWinner = (!better && !rolled && this.routingStrategy === 'balanced')
-        ? this._marginPreemptedBy(current, model, null, null, null, { count: false })
+        ? this._marginPreemptedBy(current, model, null, excluded, null, { count: false })
         : null;
       if (!better && !rolled && !marginWinner) return current.index;
       if (marginWinner) return marginWinner.index;

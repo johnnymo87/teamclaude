@@ -245,7 +245,7 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
       }
 
       const data = await res.json();
-      reportRefreshFields(Object.keys(data));
+      reportRefreshFields(Object.keys(data ?? {}));
       reportGrantTtl(data);
       return tokenPairFromResponse(data, { previousRefreshToken: refreshToken });
     } catch (err) {

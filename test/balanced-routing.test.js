@@ -1034,6 +1034,35 @@ test('previewRouteIndex agrees with actual selection under balanced margin preem
   assert.equal(actualSmall.name, 'a');
 });
 
+test('previewRouteIndex margin mirror stays inside the requested provider', () => {
+  // REGRESSION (rebase onto v1.1.20): previewRouteIndex became provider-scoped
+  // upstream (#361) via `excluded`, but our balanced margin mirror kept passing
+  // null, so _marginPreemptedBy ranked across the whole fleet. With a cheaper
+  // account in the OTHER provider, the preview named it while selection --
+  // correctly partitioned -- stayed put. Display-only (TUI/dashboard read this),
+  // but it breaks the preview-agrees-with-selection property asserted above.
+  const am = new AccountManager([
+    oauth('anth-a'),
+    oauth('anth-b'),
+    oauth('codex-c', { provider: 'codex', accountId: 'acct-codex-c' }),
+  ], 0.98, {
+    routingStrategy: 'balanced',
+    weeklyBalanceMargin: 0.10,
+  });
+  am.currentIndex = 0;
+  bucket(am, 0, 'unified7d', 0.80, 50); // current anthropic, expensive
+  bucket(am, 1, 'unified7d', 0.75, 50); // other anthropic, gap 0.05 < margin
+  bucket(am, 2, 'unified7d', 0.10, 50); // codex, far cheaper -- must NOT be named
+
+  const previewIdx = am.previewRouteIndex(OPUS, 'anthropic');
+  assert.notEqual(previewIdx, 2, 'previewRouteIndex must not cross providers to the codex account');
+
+  // The property the single-provider test asserts must also hold on a mixed fleet.
+  const actual = am.getActiveAccount(null, OPUS);
+  assert.equal(previewIdx, actual.index, 'preview must agree with selection on a mixed fleet');
+  assert.equal(actual.name, 'anth-a', 'selection stays on current: the only same-provider rival is inside the margin');
+});
+
 test('session pin re-routes under balanced when behind margin, stays pinned below margin', () => {
   // Case 1: W gap >= margin -> session pin re-routes
   const amReRoute = new AccountManager([oauth('a'), oauth('b')], 0.98, {
