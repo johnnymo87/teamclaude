@@ -1858,6 +1858,7 @@ export class AccountManager {
         byProvider.set(provider, group);
       }
 
+      /** @type {Record<string, any>} */
       const q = acc.quota || {};
       if (q.unified7d != null) {
         const res = { value: q.unified7d, provenance: 'unified' };
@@ -4541,6 +4542,7 @@ export class AccountManager {
       list.push(wVal);
     }
 
+    /** @type {Record<string, number>} */
     const spreads = {};
     for (const [provider, values] of byProvider.entries()) {
       if (values.length === 0) {
