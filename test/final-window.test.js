@@ -4,6 +4,7 @@ import { AccountManager } from '../src/account-manager.js';
 
 const H = 3600_000;
 const OPUS = 'claude-opus-5';
+const FABLE = 'claude-fable-5';
 
 function oauth(name, extra = {}) {
   return { name, type: 'oauth', accessToken: 't-' + name, refreshToken: 'r', expiresAt: Date.now() + 3600_000, ...extra };
@@ -131,4 +132,59 @@ test('final window: after the reset the account is ordinary again (no bounce)', 
   bucket(am, 1, 'unified7d', 0.02, 168); // b just reset: low W, a week away
   assert.equal(am._inFinalWindow(am.accounts[1], OPUS, Date.now()), false);
   assert.equal(am.getActiveAccount(null, OPUS).name, 'b');
+});
+
+test('final window: model-scoped window — Fable request governed by Fable family bucket', () => {
+  const am = mk(['a', 'b']);
+  bucket(am, 0, 'unified7d', 0.20, 50);
+  bucket(am, 1, 'unified7d', 0.50, 50);
+  bucket(am, 1, 'unified7dFable', 0.70, 3);
+  assert.equal(am._pickBestAvailable(null, FABLE).name, 'b');
+  assert.equal(am._pickBestAvailable(null, OPUS).name, 'a');
+});
+
+test('final window: two final-window accounts with identical reset timestamps fall through to utilization', () => {
+  const base = Date.now();
+  const am = mk(['a', 'b']);
+  bucket(am, 0, 'unified7d', 0.30, 3, base);
+  bucket(am, 1, 'unified7d', 0.70, 3, base);
+  assert.equal(am._pickBestAvailable(null, OPUS).name, 'a');
+});
+
+test('final window (session mode): heldOff is -1 for a final-window account even when far above min W', () => {
+  const am = mk(['a', 'b'], { distributeSessions: true });
+  bucket(am, 0, 'unified7d', 0.10, 50);
+  bucket(am, 1, 'unified7d', 0.84, 4);
+  const spent = am._belowBandFloor(am.accounts, OPUS, Date.now());
+  assert.deepEqual(spent, [0, -1]);
+});
+
+test('final window (session mode): even picker prefers the final-window account over a less-loaded one', () => {
+  const am = mk(['a', 'b'], { distributeSessions: true });
+  bucket(am, 0, 'unified7d', 0.10, 50);
+  bucket(am, 1, 'unified7d', 0.84, 4);
+  assert.equal(am._pickLeastLoadedEven(null, OPUS).name, 'b');
+});
+
+test('final window (session mode): knob off keeps the old held-off values', () => {
+  const am = mk(['a', 'b'], { distributeSessions: true, finalWindowHours: 0 });
+  bucket(am, 0, 'unified7d', 0.10, 50);
+  bucket(am, 1, 'unified7d', 0.84, 4);
+  assert.deepEqual(am._belowBandFloor(am.accounts, OPUS, Date.now()), [0, 1]);
+});
+
+test('final window (session mode): adaptive picker prefers the final-window account', () => {
+  const am = mk(['a', 'b'], { distributeSessions: 'adaptive' });
+  bucket(am, 0, 'unified7d', 0.10, 50);
+  bucket(am, 1, 'unified7d', 0.84, 4);
+  assert.equal(am._pickAdaptive(null, OPUS).name, 'b');
+});
+
+test('final window (session mode): two final-window accounts break tie by load terms', () => {
+  const am = mk(['a', 'b'], { distributeSessions: true });
+  bucket(am, 0, 'unified7d', 0.50, 3);
+  bucket(am, 1, 'unified7d', 0.60, 3);
+  am.recordSession('s-1', 0, OPUS);
+  am.recordSession('s-2', 0, OPUS);
+  assert.equal(am._pickLeastLoadedEven(null, OPUS).name, 'b');
 });

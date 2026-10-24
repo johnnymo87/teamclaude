@@ -1326,8 +1326,9 @@ export class AccountManager {
     // nearly spent waits behind the ones that are not, and is scored only when
     // nothing above the floor is available. Inert when the knob is off.
     const spent = this._belowBandFloor(ranked, model, now);
-    const aboveFloor = ranked.filter((_, i) => !spent[i]);
-    const tier = aboveFloor.length ? aboveFloor : ranked;
+    const finals = ranked.filter((_, i) => spent[i] < 0);
+    const aboveFloor = ranked.filter((_, i) => spent[i] <= 0);
+    const tier = finals.length ? finals : aboveFloor.length ? aboveFloor : ranked;
     if (tier.length === 1) return tier[0];
 
     // The OAuth profile already names the subscription tier. Reuse the same
@@ -1376,9 +1377,11 @@ export class AccountManager {
 
   /** Best-available biased toward the fewest active sessions, so new sessions
    * spread across equal-priority accounts instead of funnelling onto one. Order:
-   * priority → [top pressure band, when expiry routing is on] → fewest active
-   * sessions → fewest in-flight → highest expiry pressure (inert when expiry
-   * routing is off) → soonest weekly reset (the existing tiebreak). */
+   * priority → [top pressure band, when expiry routing is on] → held-off guard
+   * (under balanced: final-window (-1) → within balance margin (0) → held off (1);
+   * under expiry: above floor (0) → below floor (1)) → fewest active sessions
+   * → fewest in-flight → highest expiry pressure (inert when expiry routing is
+   * off) → soonest weekly reset (the existing tiebreak). */
   _pickLeastLoadedEven(exclude = null, model = null, advisorModel = null) {
     const now = Date.now();
     const candidates = this._bandedCandidates(exclude, model, advisorModel);
@@ -2609,10 +2612,24 @@ export class AccountManager {
       // active sessions. min(W) is strictly over the CANDIDATE SET, not the fleet
       // (design O1 corollary), preserving provider partitioning and candidate scoping.
       // W is computed once here per _pickLeastLoaded call.
+      //
+      // Final-window preference (bead claude-failover-proxy-jlc): a final-window
+      // account gets -1, sorting ahead of every load term (sessions, in-flight) so
+      // the account being used up is not starved by the session spreader; it is
+      // never "held off".
       const allW = this._computeAllW();
       const candidateW = candidates.map(a => allW[a.index]?.value ?? 0);
       const minW = Math.min(...candidateW);
-      return candidateW.map(w => (w - minW >= this.weeklyBalanceMargin - MARGIN_FLOAT_EPSILON ? 1 : 0));
+      const out = [];
+      for (let i = 0; i < candidates.length; i++) {
+        if (this._inFinalWindow(candidates[i], model, now)) {
+          out.push(-1);
+        } else {
+          const w = candidateW[i];
+          out.push(w - minW >= this.weeklyBalanceMargin - MARGIN_FLOAT_EPSILON ? 1 : 0);
+        }
+      }
+      return out;
     }
     // The band floor is an expiry-pressure concept. Non-expiry strategies
     // (e.g. drain) return all-zeros (nothing held off).
