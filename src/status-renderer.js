@@ -71,6 +71,8 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     if (threshold) lines.push(`  ${threshold}`);
     const why = unavailableLine(account, paint);
     if (why) lines.push(`  ${why}`);
+    const final = finalWindowLine(account, paint, now);
+    if (final) lines.push(`  ${final}`);
     const spend = spendLine(account, paint);
     if (spend) lines.push(`  ${spend}`);
     const resetCredits = resetCreditLine(account, paint, now);
@@ -245,6 +247,25 @@ export function unavailableLine(account, paint) {
   const text = UNAVAILABLE_TEXT[reason] || safeLine(reason, 64);
   return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)}`;
 }
+
+/**
+ * Line for an account in its final weekly window under balanced routing:
+ * e.g. "Final    weekly resets in 4h12m — used first until then".
+ * Returns null if not in final window, or if reset time is unknown/past.
+ *
+ * @param {any} account
+ * @param {any} [paint]
+ * @param {number} [now]
+ * @returns {string|null}
+ */
+export function finalWindowLine(account, paint, now = Date.now()) {
+  if (account?.finalWindow !== true) return null;
+  const resetTs = parseTs(account.quota?.unified7dReset);
+  if (!resetTs || resetTs <= now) return null;
+  const p = paint || colors(false);
+  return `${p.dim('Final'.padEnd(8))} weekly resets in ${formatDuration(resetTs - now)} — used first until then`;
+}
+
 
 // Compact names for the "switch NN%" line below — short enough that several
 // can sit on one line (`switch 7d 90%, fable 80%`), and the same short form

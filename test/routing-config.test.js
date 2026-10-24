@@ -300,3 +300,102 @@ test('config reload logs restart requirement on routingStrategy change and does 
     await new Promise(r => child.on('exit', r));
   }
 });
+
+test('startup logs finalWindowHours and passes config value to AccountManager', async () => {
+  const port = await closedPort();
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-fw-'));
+  const configPath = join(dir, 'config.json');
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: 'https://api.anthropic.com',
+    routingStrategy: 'balanced',
+    quotaProbeSeconds: 90,
+    finalWindowHours: 5,
+    accounts: [{ name: 'acct1', type: 'apikey', apiKey: 'sk-ant-test' }],
+  }));
+
+  const child = spawn(process.execPath, [cliPath, 'server', '--headless'], {
+    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath, TEAMCLAUDE_DISABLE_AUTOUPDATE: '1' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  let output = '';
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', c => { output += c; });
+  child.stderr.on('data', c => { output += c; });
+
+  try {
+    for (let i = 0; i < 50; i++) {
+      if (output.includes('TeamClaude Proxy') || output.includes('Listening on port')) break;
+      await new Promise(r => setTimeout(r, 100));
+    }
+    assert.match(output, /Routing: strategy=balanced, expiryRouting\.enabled=false, finalWindowHours=5/);
+
+    const res = await fetch(`http://127.0.0.1:${port}/teamclaude/status`);
+    assert.equal(res.status, 200);
+    const status = await res.json();
+    assert.equal(status.finalWindowHours, 5);
+  } finally {
+    child.kill('SIGTERM');
+    await new Promise(r => child.on('exit', r));
+  }
+});
+
+test('config reload logs restart requirement on finalWindowHours change', async () => {
+  const port = await closedPort();
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-fw-reload-'));
+  const configPath = join(dir, 'config.json');
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: 'https://api.anthropic.com',
+    routingStrategy: 'balanced',
+    quotaProbeSeconds: 90,
+    finalWindowHours: 5,
+    accounts: [{ name: 'acct1', type: 'apikey', apiKey: 'sk-ant-test' }],
+  }));
+
+  const child = spawn(process.execPath, [cliPath, 'server', '--headless'], {
+    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath, TEAMCLAUDE_DISABLE_AUTOUPDATE: '1' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  let output = '';
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', c => { output += c; });
+  child.stderr.on('data', c => { output += c; });
+
+  try {
+    for (let i = 0; i < 50; i++) {
+      if (output.includes('TeamClaude Proxy') || output.includes('Listening on port')) break;
+      await new Promise(r => setTimeout(r, 100));
+    }
+
+    // Update config on disk to different finalWindowHours
+    await writeFile(configPath, JSON.stringify({
+      proxy: { port, apiKey: 'tc-test' },
+      upstream: 'https://api.anthropic.com',
+      routingStrategy: 'balanced',
+      quotaProbeSeconds: 90,
+      finalWindowHours: 0,
+      accounts: [{ name: 'acct1', type: 'apikey', apiKey: 'sk-ant-test' }],
+    }));
+
+    // Trigger reload
+    const res = await fetch(`http://127.0.0.1:${port}/teamclaude/reload`, { method: 'POST' });
+    assert.equal(res.status, 200);
+
+    // Give stdout a moment to flush
+    for (let i = 0; i < 20; i++) {
+      if (output.includes('finalWindowHours change requires a restart')) break;
+      await new Promise(r => setTimeout(r, 50));
+    }
+
+    assert.match(output, /\[TeamClaude\] finalWindowHours change requires a restart/);
+  } finally {
+    child.kill('SIGTERM');
+    await new Promise(r => child.on('exit', r));
+  }
+});
+

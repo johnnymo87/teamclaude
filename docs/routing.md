@@ -234,21 +234,41 @@ Balanced routing fixes **weekly distribution** across multiple accounts.
    - **Floor clamp (`>= 0.02`):** `weeklyBalanceMargin` is clamped to at least `0.02`, and values below `0.05` log a startup warning. Upstream quota updates arrive in 0.01 quanta. An un-clamped margin (such as 0 or 0.01) would move the cursor on a 1% differential, causing constant rotation and prompt-cache thrashing. Clamping strictly above zero guarantees cycle-freedom and bounds rotation churn.
 4. **Spill guards:** Margin preemption will not move the cursor if the candidate account's 5-hour session bucket sits at `unified5h >= 0.90` (preserving headroom for high-demand bursts) or if the candidate is paused.
 
+### Final-window preference (`finalWindowHours`)
+
+Because balanced routing ranks by weekly utilization and requires a margin advantage before moving, an account whose weekly window is about to reset can sit with remaining quota while traffic stays on accounts resetting days later — leaving that remaining quota to expire unused.
+
+Configuring `finalWindowHours` (e.g. `5`, bounded to `0`..`24`, default `0` = off) gives priority to accounts resetting soon:
+
+- **Condition:** An account is in its final window when strategy is `balanced`, `finalWindowHours > 0`, the reset of its governing weekly window for the model is known and within `(0, finalWindowHours * 3600_000]` ms, the account is available (below the switch threshold), and its 5h utilization is below the margin spill guard (`unified5h < 0.90` or unreported).
+- **Ranking (`_pickBestAvailable`):** After priority, final-window accounts sort ahead of non-final accounts. Between two final-window accounts, the sooner reset wins.
+- **Margin bypass (`_marginPreemptedBy`):** When the ranking winner is in its final window, the cursor moves without requiring the `weeklyBalanceMargin` differential. The 5h (`MARGIN_5H_GUARD = 0.90`) and pause guards still apply. Counted in `marginMove.final_window`.
+- **Session distribution (`_belowBandFloor`):** Under session distribution modes (`distributeSessions`), final-window accounts receive held-off score `-1`, sorting before load terms so they are spent first and never held off.
+
 ### Observability on `/status`
 
 Under balanced routing, `teamclaude status --json` (and `GET /teamclaude/status`) exposes:
 
 - **`routingStrategy`** — the active strategy (`"balanced"`, `"expiry"`, or `"drain"`).
 - **`weeklyBalanceMargin`** — the effective clamped balance margin.
+- **`finalWindowHours`** — the configured final-window threshold (`0` = off).
 - **`accounts[].W`** — each account's model-independent weekly balance metric `{ value, provenance }` (`provenance`: `'unified'`, `'family-proxy'`, `'median'`, or `'empty'`).
+- **`accounts[].finalWindow`** — boolean indicating whether the account is currently available and in its final weekly window.
 - **`spread`** — per-provider `max(W) - min(W)` utilization spread, designed for alerting (e.g. spread >= margin sustained for > 2 hours with zero moves).
 - **`marginMove`** — counters tracking the outcomes of margin preemption evaluations:
   - `done`: margin preemption successfully rotated the cursor to a lower-W candidate.
-  - `blocked_5h`: candidate had >= margin advantage but was blocked because `unified5h >= 0.90`.
-  - `blocked_paused`: candidate had >= margin advantage but is paused.
+  - `final_window`: cursor rotated onto an account in its final weekly window, bypassing the balance margin.
+  - `blocked_5h`: candidate had >= margin advantage (or final window) but was blocked because `unified5h >= 0.90`.
+  - `blocked_paused`: candidate had >= margin advantage (or final window) but is paused.
   - `below_margin`: best candidate's W was not lower than current W by at least `weeklyBalanceMargin`.
   - `self_best`: current account already ranks best (or no candidate available) in steady state.
   - `pin_released`: session-driven margin preemption released a session pin in `_selectForSession`.
+
+In terminal output (`teamclaude status`), any account in its final window displays a plain summary line:
+
+```text
+  Final    weekly resets in 4h12m — used first until then
+```
 
 ## Expiry-pressure routing
 

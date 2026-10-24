@@ -188,3 +188,32 @@ test('final window (session mode): two final-window accounts break tie by load t
   am.recordSession('s-2', 0, OPUS);
   assert.equal(am._pickLeastLoadedEven(null, OPUS).name, 'b');
 });
+
+test('final window: getStatus reports top-level finalWindowHours and per-account finalWindow', () => {
+  const am = mk(['a', 'b'], { finalWindowHours: 5 });
+  bucket(am, 0, 'unified7d', 0.20, 50); // not final
+  bucket(am, 1, 'unified7d', 0.84, 4);  // in final window
+  const status = am.getStatus();
+  assert.equal(status.finalWindowHours, 5);
+  assert.equal(status.accounts[0].finalWindow, false);
+  assert.equal(status.accounts[1].finalWindow, true);
+
+  // An unavailable account is never marked finalWindow in status (e.g. disabled or at threshold)
+  am.accounts[1].disabled = true;
+  assert.equal(am.getStatus().accounts[1].finalWindow, false);
+  am.accounts[1].disabled = false;
+  am.accounts[1].quota.unified7d = 0.99; // threshold is 0.98
+  assert.equal(am.getStatus().accounts[1].finalWindow, false);
+});
+
+test('final window: getStatus marginMove includes final_window counter', () => {
+  const am = mk(['a', 'b'], { finalWindowHours: 5 });
+  am.currentIndex = 0;
+  bucket(am, 0, 'unified7d', 0.81, 50);
+  bucket(am, 1, 'unified7d', 0.84, 4);
+  am.getActiveAccount(null, OPUS);
+  const status = am.getStatus();
+  assert.equal(typeof status.marginMove.final_window, 'number');
+  assert.equal(status.marginMove.final_window, 1);
+});
+

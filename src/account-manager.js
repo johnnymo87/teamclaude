@@ -1322,9 +1322,9 @@ export class AccountManager {
     const ranked = eligible.filter(a => (a.priority || 0) === topPriority);
     if (ranked.length === 1) return ranked[0];
     // The same floor the even walk applies ahead of its load terms (see
-    // _belowBandFloor): with expiry routing on, an account the tree knows is
-    // nearly spent waits behind the ones that are not, and is scored only when
-    // nothing above the floor is available. Inert when the knob is off.
+    // _belowBandFloor): under balanced routing, final-window accounts lead (-1);
+    // under expiry routing, nearly-spent accounts wait behind (> 0). Candidate
+    // tiers: finals first, then within margin / above floor, then all.
     const spent = this._belowBandFloor(ranked, model, now);
     const finals = ranked.filter((_, i) => spent[i] < 0);
     const aboveFloor = ranked.filter((_, i) => spent[i] <= 0);
@@ -4657,6 +4657,7 @@ export class AccountManager {
       defaultTargets[provider] = this._routeTarget(null, provider);
     }
     const allW = this._computeAllW();
+    const now = Date.now();
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
       currentAccounts,
@@ -4673,6 +4674,7 @@ export class AccountManager {
         ? { ...this.switchThreshold } : null,
       routingStrategy: this.routingStrategy,
       weeklyBalanceMargin: this.weeklyBalanceMargin,
+      finalWindowHours: this.finalWindowHours,
       // The knob as the server resolved it, defaults and clamps applied, so an
       // operator reading status sees the configuration the router is using.
       expiryRouting: { ...this.expiryRouting },
@@ -4703,6 +4705,7 @@ export class AccountManager {
         // Distinguishes a local threshold decision from an upstream rejection —
         // without it the two are indistinguishable in status output (#166).
         unavailable: this.unavailableReason(a),
+        finalWindow: this.unavailableReason(a) == null && this._inFinalWindow(a, null, now),
         sessions: sessions.perAccount[a.index] || 0,
         knownSessions: sessions.knownPerAccount[a.index] || 0,
         // Shared-weekly pressure (model-agnostic), so the ordering the router
@@ -4730,10 +4733,10 @@ export class AccountManager {
         rateLimitedUntil: a.rateLimitedUntil
           ? new Date(a.rateLimitedUntil).toISOString()
           : null,
-        pausedUntil: a.pausedUntil && a.pausedUntil > Date.now()
+        pausedUntil: a.pausedUntil && a.pausedUntil > now
           ? new Date(a.pausedUntil).toISOString()
           : null,
-        entitlementDeniedUntil: a.entitlementDeniedUntil && a.entitlementDeniedUntil > Date.now()
+        entitlementDeniedUntil: a.entitlementDeniedUntil && a.entitlementDeniedUntil > now
           ? new Date(a.entitlementDeniedUntil).toISOString()
           : null,
       })),
