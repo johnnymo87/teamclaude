@@ -354,7 +354,7 @@ test('startup logs finalWindowHours and passes config value to AccountManager', 
   }
 });
 
-test('config reload logs restart requirement on finalWindowHours change', async () => {
+test('config reload applies finalWindowHours live and logs the change', async () => {
   const port = await closedPort();
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-fw-reload-'));
   const configPath = join(dir, 'config.json');
@@ -400,11 +400,17 @@ test('config reload logs restart requirement on finalWindowHours change', async 
 
     // Give stdout a moment to flush
     for (let i = 0; i < 20; i++) {
-      if (output.includes('finalWindowHours change requires a restart')) break;
+      if (output.includes('finalWindowHours changed: 5 -> 0')) break;
       await new Promise(r => setTimeout(r, 50));
     }
 
-    assert.match(output, /\[TeamClaude\] finalWindowHours change requires a restart/);
+    assert.match(output, /\[TeamClaude\] finalWindowHours changed: 5 -> 0/);
+
+    // Verify /teamclaude/status reflects the updated finalWindowHours live
+    const statusRes = await fetch(`http://127.0.0.1:${port}/teamclaude/status`);
+    assert.equal(statusRes.status, 200);
+    const status = await statusRes.json();
+    assert.equal(status.finalWindowHours, 0);
   } finally {
     child.kill('SIGTERM');
     await new Promise(r => child.on('exit', r));

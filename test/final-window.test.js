@@ -371,3 +371,30 @@ test('final window: current reaching the switch threshold leaves via the normal 
   assert.equal(am.getActiveAccount(null, OPUS).name, 'a', 'reaches weekly threshold -> switches to a');
 });
 
+test('final window: eligibility reports outranked by final-window account', () => {
+  const am = mk(['a', 'b'], { finalWindowHours: 5 });
+  bucket(am, 0, 'unified7d', 0.81, 50); // a: W = 0.81
+  bucket(am, 1, 'unified7d', 0.84, 4);  // b: W = 0.84, resets in 4h -> in final window
+  am.currentIndex = 0;
+
+  const elA = am.eligibility(0);
+  assert.equal(elA.eligible, false);
+  assert.equal(elA.reason, 'outranked by final-window account "b"');
+
+  // b itself is eligible
+  const elB = am.eligibility(1);
+  assert.equal(elB.eligible, true);
+
+  // With finalWindow off (0), b has higher W so does NOT outrank a
+  const amOff = mk(['a', 'b'], { finalWindowHours: 0 });
+  bucket(amOff, 0, 'unified7d', 0.81, 50);
+  bucket(amOff, 1, 'unified7d', 0.84, 4);
+  assert.equal(amOff.eligibility(0).eligible, true);
+
+  // When an account outranks on ordinary weekly balance (not final window):
+  bucket(amOff, 1, 'unified7d', 0.20, 50); // b lower W by > margin 0.10
+  assert.equal(amOff.eligibility(0).eligible, false);
+  assert.equal(amOff.eligibility(0).reason, 'outranked on weekly balance by "b"');
+});
+
+

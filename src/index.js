@@ -422,7 +422,9 @@ async function serverCommand() {
     }
     const diskFinalWindow = normalizeFinalWindowHours(diskConfig.finalWindowHours);
     if (diskFinalWindow !== accountManager.finalWindowHours) {
-      console.log('[TeamClaude] finalWindowHours change requires a restart');
+      console.log(`[TeamClaude] finalWindowHours changed: ${accountManager.finalWindowHours} -> ${diskFinalWindow}`);
+      accountManager.finalWindowHours = diskFinalWindow;
+      config.finalWindowHours = diskFinalWindow;
     }
     const added = await syncAccountsFromDisk(diskConfig, config, accountManager);
     // Pick up client-key edits (proxy.clientKeys is read live by both auth

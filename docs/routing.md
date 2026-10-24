@@ -238,10 +238,10 @@ Balanced routing fixes **weekly distribution** across multiple accounts.
 
 Because balanced routing ranks by weekly utilization and requires a margin advantage before moving, an account whose weekly window is about to reset can sit with remaining quota while traffic stays on accounts resetting days later — leaving that remaining quota to expire unused.
 
-Configuring `finalWindowHours` (e.g. `5`, bounded to `0`..`24`, default `0` = off) gives priority to accounts resetting soon:
+Configuring `finalWindowHours` (e.g. `5`, bounded to `0`..`24`, default `0` = off) gives priority to accounts resetting soon (applied live on config reload):
 
-- **Condition:** An account is in its final window when strategy is `balanced`, `finalWindowHours > 0`, the reset of its governing weekly window for the model is known and within `(0, finalWindowHours * 3600_000]` ms, the account is available (below the switch threshold), and its 5h utilization is below the margin spill guard (`unified5h < 0.90` or unreported).
-- **Ranking (`_pickBestAvailable`):** After priority, final-window accounts sort ahead of non-final accounts. Between two final-window accounts, the sooner reset wins.
+- **Condition:** An account is in its final window when strategy is `balanced`, `finalWindowHours > 0`, the reset of its shared weekly window is known and within `(0, finalWindowHours * 3600_000]` ms, and the account is available. Entry onto a non-current account additionally requires `unified5h < 0.90` and shared weekly headroom `>= 0.03`; once current, the cursor holds through the reset until availability ends it.
+- **Ranking (`_pickBestAvailable`):** After priority, final-window accounts sort ahead of non-final accounts. Between two final-window accounts, the sooner shared weekly reset wins.
 - **Margin bypass (`_marginPreemptedBy`):** When the ranking winner is in its final window, the cursor moves without requiring the `weeklyBalanceMargin` differential. The 5h (`MARGIN_5H_GUARD = 0.90`) and pause guards still apply. Counted in `marginMove.final_window`.
 - **Session distribution (`_belowBandFloor`):** Under session distribution modes (`distributeSessions`), final-window accounts receive held-off score `-1`, sorting before load terms so they are spent first and never held off.
 

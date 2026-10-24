@@ -2220,7 +2220,11 @@ export class AccountManager {
     const providerExclude = this._excludeOtherProviders(null, providerOf(account));
     const marginPreemptor = this._marginPreemptedBy(account, null, null, providerExclude, null, { count: false });
     if (marginPreemptor) {
-      return { eligible: false, reason: `outranked on weekly balance by "${marginPreemptor.name}"` };
+      const isFinal = this._inFinalWindow(marginPreemptor, account);
+      const reason = isFinal
+        ? `outranked by final-window account "${marginPreemptor.name}"`
+        : `outranked on weekly balance by "${marginPreemptor.name}"`;
+      return { eligible: false, reason };
     }
     return { eligible: true };
   }
