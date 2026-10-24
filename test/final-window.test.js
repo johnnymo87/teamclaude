@@ -47,7 +47,7 @@ test('final window: off (0) and non-balanced strategies keep current ranking', (
     bucket(ref, 0, 'unified7d', 0.20, 50);
     bucket(ref, 1, 'unified7d', 0.84, 4);
     assert.equal(am._pickBestAvailable(null, OPUS).name, ref._pickBestAvailable(null, OPUS).name, JSON.stringify(opts));
-    assert.equal(am._inFinalWindow(am.accounts[1], OPUS, Date.now()), false, JSON.stringify(opts));
+    assert.equal(am._inFinalWindow(am.accounts[1], Date.now()), false, JSON.stringify(opts));
   }
 });
 
@@ -56,13 +56,13 @@ test('final window: boundaries — unknown, past, exactly at window edge, just b
   const a = am.accounts[0];
   const now = Date.now();
   bucket(am, 0, 'unified7d', 0.5, null, now);
-  assert.equal(am._inFinalWindow(a, OPUS, now), false, 'unknown reset');
+  assert.equal(am._inFinalWindow(a, now), false, 'unknown reset');
   bucket(am, 0, 'unified7d', 0.5, -0.1, now);
-  assert.equal(am._inFinalWindow(a, OPUS, now), false, 'reset in the past');
+  assert.equal(am._inFinalWindow(a, now), false, 'reset in the past');
   bucket(am, 0, 'unified7d', 0.5, 5, now);
-  assert.equal(am._inFinalWindow(a, OPUS, now), true, 'exactly 5h');
+  assert.equal(am._inFinalWindow(a, now), true, 'exactly 5h');
   bucket(am, 0, 'unified7d', 0.5, 5.001, now);
-  assert.equal(am._inFinalWindow(a, OPUS, now), false, 'just beyond');
+  assert.equal(am._inFinalWindow(a, now), false, 'just beyond');
 });
 
 test('final window: 5h guard — unified5h >= 0.90 disqualifies, below qualifies, unknown qualifies', () => {
@@ -70,11 +70,11 @@ test('final window: 5h guard — unified5h >= 0.90 disqualifies, below qualifies
   const a = am.accounts[0];
   bucket(am, 0, 'unified7d', 0.5, 3);
   a.quota.unified5h = 0.90;
-  assert.equal(am._inFinalWindow(a, OPUS, Date.now()), false);
+  assert.equal(am._inFinalWindow(a, Date.now()), false);
   a.quota.unified5h = 0.89;
-  assert.equal(am._inFinalWindow(a, OPUS, Date.now()), true);
+  assert.equal(am._inFinalWindow(a, Date.now()), true);
   a.quota.unified5h = null;
-  assert.equal(am._inFinalWindow(a, OPUS, Date.now()), true);
+  assert.equal(am._inFinalWindow(a, Date.now()), true);
 });
 
 test('final window: sooner reset wins between two final-window accounts', () => {
@@ -130,17 +130,96 @@ test('final window: after the reset the account is ordinary again (no bounce)', 
   am.currentIndex = 1;
   bucket(am, 0, 'unified7d', 0.81, 50);
   bucket(am, 1, 'unified7d', 0.02, 168); // b just reset: low W, a week away
-  assert.equal(am._inFinalWindow(am.accounts[1], OPUS, Date.now()), false);
+  assert.equal(am._inFinalWindow(am.accounts[1], Date.now()), false);
   assert.equal(am.getActiveAccount(null, OPUS).name, 'b');
 });
 
-test('final window: model-scoped window — Fable request governed by Fable family bucket', () => {
+test('final window: judged on shared weekly window — Fable-only near reset does NOT qualify', () => {
   const am = mk(['a', 'b']);
   bucket(am, 0, 'unified7d', 0.20, 50);
   bucket(am, 1, 'unified7d', 0.50, 50);
   bucket(am, 1, 'unified7dFable', 0.70, 3);
-  assert.equal(am._pickBestAvailable(null, FABLE).name, 'b');
+  assert.equal(am._inFinalWindow(am.accounts[1]), false, 'Fable-only near reset must not qualify for final window');
+  assert.equal(am._pickBestAvailable(null, FABLE).name, 'a');
   assert.equal(am._pickBestAvailable(null, OPUS).name, 'a');
+});
+
+test('final window: shared-weekly final account wins for both Opus and Fable requests', () => {
+  const am = mk(['a', 'b']);
+  bucket(am, 0, 'unified7d', 0.84, 4);  // a: shared weekly in 4h -> final
+  bucket(am, 0, 'unified7dFable', 0.10, 100);
+  bucket(am, 1, 'unified7d', 0.20, 50); // b: shared weekly in 50h
+  bucket(am, 1, 'unified7dFable', 0.05, 50);
+  assert.equal(am._inFinalWindow(am.accounts[0]), true, 'shared weekly near reset qualifies');
+  assert.equal(am._pickBestAvailable(null, OPUS).name, 'a');
+  assert.equal(am._pickBestAvailable(null, FABLE).name, 'a');
+});
+
+test('final window: regression — alternating Opus/Fable requests keep cursor on shared-weekly final account (no ping-pong)', () => {
+  const am = mk(['a', 'b', 'e']);
+  const b = am.accounts[1];
+  // A: shared weekly resets in 4h, Fable reset in 100h
+  bucket(am, 0, 'unified7d', 0.84, 4);
+  bucket(am, 0, 'unified7dFable', 0.10, 100);
+  // B: resets in 60h
+  bucket(am, 1, 'unified7d', 0.40, 60);
+  bucket(am, 1, 'unified7dFable', 0.05, 60);
+  // E: resets in 100h
+  bucket(am, 2, 'unified7d', 0.22, 100);
+  bucket(am, 2, 'unified7dFable', 0.0, 100);
+
+  am._setCurrent(b);
+  assert.equal(am.currentIndex, 1);
+
+  const initialMoves = am.marginMove.final_window;
+  const seq = [OPUS, FABLE, OPUS, FABLE, OPUS];
+  for (const m of seq) {
+    const picked = am.getActiveAccount(new Set(), m);
+    assert.equal(picked.name, 'a', `request for ${m} should stay on account 'a'`);
+    assert.equal(am.currentIndex, 0, `cursor must stay on 'a' (index 0) for ${m}`);
+  }
+  // final_window move counter increments exactly once on initial transition from b to a
+  assert.equal(am.marginMove.final_window, initialMoves + 1);
+  assert.equal(am.marginMove.done, 0);
+});
+
+test('final window: no bounce at weekly reset when current account W is imputed (median or empty)', async () => {
+  for (const fw of [5, 0]) {
+    const am = new AccountManager(['a', 'b', 'c', 'd', 'e'].map(n => oauth(n)), 0.98, {
+      routingStrategy: 'balanced', weeklyBalanceMargin: 0.10, finalWindowHours: fw,
+    });
+    for (const acct of am.accounts) acct.probing = false;
+    const a = am.accounts[0];
+    bucket(am, 0, 'unified7d', 0.90, 0.000005);
+    bucket(am, 1, 'unified7d', 0.88, 85);
+    bucket(am, 2, 'unified7d', 0.89, 30);
+    bucket(am, 3, 'unified7d', 0.26, 144);
+    bucket(am, 4, 'unified7d', 0.22, 125);
+
+    am._setCurrent(a);
+    assert.equal(am.currentIndex, 0);
+
+    // Simulate weekly reset expiration: unified7d cleared to null
+    a.quota.unified7d = null;
+    a.quota.unified7dReset = null;
+
+    const r1 = am.getActiveAccount(new Set(), OPUS).name;
+    if (fw > 0) {
+      assert.equal(r1, 'a', 'with finalWindowHours > 0, cursor must hold on a through reset');
+      assert.equal(am.marginMove.held_imputed, 1, 'held_imputed must increment when holding on imputed W');
+
+      // Next probe: a reads ~0 with fresh reset
+      bucket(am, 0, 'unified7d', 0.01, 168);
+      const r2 = am.getActiveAccount(new Set(), OPUS).name;
+      assert.equal(r2, 'a', 'after probe, cursor stays on a');
+    } else {
+      assert.equal(r1, 'e', 'with finalWindowHours === 0, old behaviour moves to e');
+      // Next probe: a reads ~0, then cursor moves back to a
+      bucket(am, 0, 'unified7d', 0.01, 168);
+      const r2 = am.getActiveAccount(new Set(), OPUS).name;
+      assert.equal(r2, 'a', 'after probe, cursor moves back to a');
+    }
+  }
 });
 
 test('final window: two final-window accounts with identical reset timestamps fall through to utilization', () => {

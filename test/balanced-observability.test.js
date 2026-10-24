@@ -102,6 +102,7 @@ test('marginMove counter increments done on a successful margin preemption move'
     self_best: 0,
     pin_released: 0,
     final_window: 0,
+    held_imputed: 0,
   });
 
   // Real selection triggers margin preemption move to candidate 1
@@ -118,6 +119,7 @@ test('marginMove counter increments done on a successful margin preemption move'
     self_best: 0,
     pin_released: 0,
     final_window: 0,
+    held_imputed: 0,
   });
 
   // Also exposed on getStatus()
@@ -129,6 +131,7 @@ test('marginMove counter increments done on a successful margin preemption move'
     self_best: 0,
     pin_released: 0,
     final_window: 0,
+    held_imputed: 0,
   });
 });
 
@@ -162,6 +165,7 @@ test('marginMove counter increments blocked_5h when best candidate sits at unifi
     self_best: 0,
     pin_released: 0,
     final_window: 0,
+    held_imputed: 0,
   });
 });
 
@@ -196,6 +200,7 @@ test('marginMove counter increments blocked_paused when best candidate is paused
     self_best: 0,
     pin_released: 0,
     final_window: 0,
+    held_imputed: 0,
   });
 });
 
@@ -229,6 +234,7 @@ test('marginMove counter increments below_margin when W gap is below weeklyBalan
     self_best: 0,
     pin_released: 0,
     final_window: 0,
+    held_imputed: 0,
   });
 });
 
@@ -255,6 +261,7 @@ test('marginMove counter increments self_best when current account is already be
     self_best: 0,
     pin_released: 0,
     final_window: 0,
+    held_imputed: 0,
   });
 
   // Current account (0) is already best (0.20 < 0.80). Selection stays on current.
@@ -271,6 +278,7 @@ test('marginMove counter increments self_best when current account is already be
     self_best: 1,
     pin_released: 0,
     final_window: 0,
+    held_imputed: 0,
   });
 });
 
@@ -303,6 +311,7 @@ test('previewRouteIndex calls _marginPreemptedBy with count:false and does NOT i
     self_best: 0,
     pin_released: 0,
     final_window: 0,
+    held_imputed: 0,
   }, 'previewRouteIndex must not increment any marginMove counter');
 
   // Also test preview with 5h wall:
@@ -318,6 +327,7 @@ test('previewRouteIndex calls _marginPreemptedBy with count:false and does NOT i
     self_best: 0,
     pin_released: 0,
     final_window: 0,
+    held_imputed: 0,
   }, 'previewRouteIndex with 5h wall must not increment any marginMove counter');
 
   // Also test preview with paused candidate:
@@ -334,6 +344,7 @@ test('previewRouteIndex calls _marginPreemptedBy with count:false and does NOT i
     self_best: 0,
     pin_released: 0,
     final_window: 0,
+    held_imputed: 0,
   }, 'previewRouteIndex with paused candidate must not increment any marginMove counter');
 
   // Also test preview with gap below margin:
@@ -350,6 +361,7 @@ test('previewRouteIndex calls _marginPreemptedBy with count:false and does NOT i
     self_best: 0,
     pin_released: 0,
     final_window: 0,
+    held_imputed: 0,
   }, 'previewRouteIndex below margin must not increment any marginMove counter');
 
   // In contrast, real selection SHOULD count:
@@ -455,6 +467,7 @@ test("under 'expiry' and 'drain' strategies, fields are present but inert (no co
       self_best: 0,
       pin_released: 0,
       final_window: 0,
+      held_imputed: 0,
     });
     assert.ok(status.spread);
     assert.deepEqual(status.accounts[0].W, { value: 0.80, provenance: 'unified' });
@@ -473,6 +486,7 @@ test("under 'expiry' and 'drain' strategies, fields are present but inert (no co
       self_best: 0,
       pin_released: 0,
       final_window: 0,
+      held_imputed: 0,
     }, `marginMove must remain inert under strategy ${strategy}`);
   }
 });
@@ -512,6 +526,7 @@ test('HTTP GET /teamclaude/status exposes routingStrategy, weeklyBalanceMargin, 
       self_best: 0,
       pin_released: 0,
       final_window: 0,
+      held_imputed: 0,
     });
     assert.equal(data.spread.anthropic, 0.60);
     assert.deepEqual(data.accounts[0].W, { value: 0.85, provenance: 'unified' });

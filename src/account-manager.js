@@ -434,6 +434,7 @@ export class AccountManager {
     // - self_best: current account already ranks best or no candidate was available.
     // - pin_released: session-driven margin preemption released a session pin in _selectForSession.
     // - final_window: cursor rotated to a candidate in its final weekly window (bypassing margin).
+    // - held_imputed: current account W was imputed (median/empty) after reset; held cursor to avoid bounce.
     this.marginMove = {
       done: 0,
       blocked_5h: 0,
@@ -442,6 +443,7 @@ export class AccountManager {
       self_best: 0,
       pin_released: 0,
       final_window: 0,
+      held_imputed: 0,
     };
 
     // Sessions still being drained after distribution was turned off (see
@@ -2113,10 +2115,10 @@ export class AccountManager {
    * by at least the margin, so the cycle's total W change is strictly negative
    * — a contradiction. Hence no cycle.
    *
-   * A final-window move may raise W; it is still finite because it goes only to
-   * the ranking winner, a final-window current is its own winner unless another
-   * resets strictly sooner, and the window ends by reset (W drops, it stays
-   * winner) or by the threshold (unavailable).
+   * A final window causes a bounded number of cursor moves (entry; possibly
+   * out at the current's 5h switch threshold and back at its 5h reset; none at
+   * the weekly reset thanks to FIX 2), and they are not cycles because each is
+   * driven by a monotone signal (time, 5h rising) or by availability.
    *
    * Preconditions for the proof to hold (design D4 [R1]):
    * 1. weeklyBalanceMargin >= 0.02 > 0 strictly (clamps prevent 0, which would
@@ -2140,10 +2142,16 @@ export class AccountManager {
 
     if ((best.priority || 0) > (current.priority || 0)) return null;
 
-    const finalMove = this._inFinalWindow(best, model, Date.now());
+    const W = allW || this._computeAllW();
+    const curW = W[current.index];
+    if (this.finalWindowHours > 0 && (curW?.provenance === 'median' || curW?.provenance === 'empty')) {
+      if (count) this.marginMove.held_imputed++;
+      return null;
+    }
+
+    const finalMove = this._inFinalWindow(best, Date.now());
     if (!finalMove) {
-      const W = allW || this._computeAllW();
-      const wCurrent = W[current.index]?.value ?? 0;
+      const wCurrent = curW?.value ?? 0;
       const wBest = W[best.index]?.value ?? 0;
       if (wCurrent - wBest < this.weeklyBalanceMargin - MARGIN_FLOAT_EPSILON) {
         if (count) this.marginMove.below_margin++;
@@ -2491,18 +2499,17 @@ export class AccountManager {
 
   /**
    * Whether the account is in its final weekly window: balanced strategy, knob
-   * on, the governing weekly window for this model (the same clock ranking
-   * reads) resets within finalWindowHours, and its 5h window is not near the
-   * margin spill guard. Availability is the caller's concern (candidates are
-   * already filtered). Unknown or past resets never qualify.
+   * on, the shared weekly window (unified7d) resets within finalWindowHours,
+   * and its 5h window is not near the margin spill guard. Availability is the
+   * caller's concern (candidates are already filtered). Unknown or past resets
+   * never qualify.
    * @param {any} account
-   * @param {string|null} [model]
    * @param {number} [now]
    * @returns {boolean}
    */
-  _inFinalWindow(account, model = null, now = Date.now()) {
+  _inFinalWindow(account, now = Date.now()) {
     if (!account || this.routingStrategy !== 'balanced' || !(this.finalWindowHours > 0)) return false;
-    const resetAt = this._governingWindow(account, model).resetAt;
+    const resetAt = this._governingWindow(account, null).resetAt;
     if (typeof resetAt !== 'number' || !Number.isFinite(resetAt)) return false;
     const left = resetAt - now;
     if (!(left > 0) || left > this.finalWindowHours * 3600_000) return false;
@@ -2621,7 +2628,7 @@ export class AccountManager {
       const minW = Math.min(...candidateW);
       const out = [];
       for (let i = 0; i < candidates.length; i++) {
-        if (this._inFinalWindow(candidates[i], model, now)) {
+        if (this._inFinalWindow(candidates[i], now)) {
           out.push(-1);
         } else {
           const w = candidateW[i];
@@ -3691,6 +3698,7 @@ export class AccountManager {
     let best = null;
     let bestPriority = Infinity;
     let bestFinal = Infinity;
+    let bestSharedReset = Infinity;
     let bestPressure = Infinity;
     let bestReset = Infinity;
 
@@ -3700,7 +3708,8 @@ export class AccountManager {
     const pressures = this._rankedPressures(candidates, model, now);
     candidates.forEach((account, i) => {
       const priority = account.priority || 0;
-      const finalKey = this._inFinalWindow(account, model, now) ? 0 : 1;
+      const finalKey = this._inFinalWindow(account, now) ? 0 : 1;
+      const sharedReset = this._governingWindow(account, null).resetAt ?? Infinity;
       const pressure = pressures[i];
       // Rank by the reset of the weekly window that governs THIS model (Fable and
       // Sonnet have their own, and a family can be metered by a learned scoped
@@ -3710,12 +3719,13 @@ export class AccountManager {
       const weeklyReset = this._rankedReset(account, model);
       const better = priority !== bestPriority ? priority < bestPriority
         : finalKey !== bestFinal ? finalKey < bestFinal
-        : finalKey === 0 && weeklyReset !== bestReset ? weeklyReset < bestReset
+        : finalKey === 0 && sharedReset !== bestSharedReset ? sharedReset < bestSharedReset
         : pressure !== bestPressure ? pressure < bestPressure
         : weeklyReset < bestReset;
       if (better) {
         bestPriority = priority;
         bestFinal = finalKey;
+        bestSharedReset = sharedReset;
         bestPressure = pressure;
         bestReset = weeklyReset;
         best = account;
@@ -4704,7 +4714,7 @@ export class AccountManager {
         // Distinguishes a local threshold decision from an upstream rejection —
         // without it the two are indistinguishable in status output (#166).
         unavailable: this.unavailableReason(a),
-        finalWindow: this.unavailableReason(a) == null && this._inFinalWindow(a, null, now),
+        finalWindow: this.unavailableReason(a) == null && this._inFinalWindow(a, now),
         sessions: sessions.perAccount[a.index] || 0,
         knownSessions: sessions.knownPerAccount[a.index] || 0,
         // Shared-weekly pressure (model-agnostic), so the ordering the router

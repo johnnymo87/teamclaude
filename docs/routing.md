@@ -263,6 +263,7 @@ Under balanced routing, `teamclaude status --json` (and `GET /teamclaude/status`
   - `below_margin`: best candidate's W was not lower than current W by at least `weeklyBalanceMargin`.
   - `self_best`: current account already ranks best (or no candidate available) in steady state.
   - `pin_released`: session-driven margin preemption released a session pin in `_selectForSession`.
+  - `held_imputed`: cursor held on the current account whose weekly quota just reset (W imputed from fleet median or empty) until probed, avoiding a bounce onto another account.
 
 In terminal output (`teamclaude status`), any account in its final window displays a plain summary line:
 
