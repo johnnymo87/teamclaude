@@ -5,7 +5,7 @@ import { createInterface } from 'node:readline';
 import { createWriteStream } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import net from 'node:net';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState, validateRoutingConfig } from './config.js';
+import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState, validateRoutingConfig, normalizeFinalWindowHours } from './config.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
@@ -420,8 +420,7 @@ async function serverCommand() {
     if (diskConfig.routingStrategy && diskConfig.routingStrategy !== accountManager.routingStrategy) {
       console.log('[TeamClaude] routingStrategy change requires a restart');
     }
-    const diskFinalWindow = typeof diskConfig.finalWindowHours === 'number' && Number.isFinite(diskConfig.finalWindowHours)
-      && diskConfig.finalWindowHours >= 0 && diskConfig.finalWindowHours <= 24 ? diskConfig.finalWindowHours : 0;
+    const diskFinalWindow = normalizeFinalWindowHours(diskConfig.finalWindowHours);
     if (diskFinalWindow !== accountManager.finalWindowHours) {
       console.log('[TeamClaude] finalWindowHours change requires a restart');
     }

@@ -2,11 +2,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
 import { spawn } from 'node:child_process';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createDefaultConfig, validateRoutingConfig, VALID_ROUTING_STRATEGIES } from '../src/config.js';
+import { createDefaultConfig, validateRoutingConfig, VALID_ROUTING_STRATEGIES, normalizeFinalWindowHours } from '../src/config.js';
 import { AccountManager } from '../src/account-manager.js';
 
 const cliPath = fileURLToPath(new URL('../src/index.js', import.meta.url));
@@ -93,6 +93,17 @@ test('validateRoutingConfig rejects balanced strategy when quotaProbeSeconds is 
       () => validateRoutingConfig({ routingStrategy: 'balanced', quotaProbeSeconds: invalidProbe }),
       /"balanced" routing strategy requires "quotaProbeSeconds" > 0/
     );
+  }
+});
+
+test('normalizeFinalWindowHours accepts numbers in [0, 24] and falls back to 0', () => {
+  assert.equal(normalizeFinalWindowHours(0), 0);
+  assert.equal(normalizeFinalWindowHours(5), 5);
+  assert.equal(normalizeFinalWindowHours(12.5), 12.5);
+  assert.equal(normalizeFinalWindowHours(24), 24);
+
+  for (const invalid of [-1, -0.1, 24.01, 25, NaN, Infinity, -Infinity, '5', '', null, undefined, {}, [], true, false]) {
+    assert.equal(normalizeFinalWindowHours(invalid), 0, `invalid=${String(invalid)}`);
   }
 });
 
@@ -339,6 +350,7 @@ test('startup logs finalWindowHours and passes config value to AccountManager', 
   } finally {
     child.kill('SIGTERM');
     await new Promise(r => child.on('exit', r));
+    await rm(dir, { recursive: true, force: true });
   }
 });
 
@@ -396,6 +408,7 @@ test('config reload logs restart requirement on finalWindowHours change', async 
   } finally {
     child.kill('SIGTERM');
     await new Promise(r => child.on('exit', r));
+    await rm(dir, { recursive: true, force: true });
   }
 });
 

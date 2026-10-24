@@ -11,7 +11,7 @@ import { decideBand, pressureOf, pressureRank, assertNever } from './band-decisi
 import { BurnRateLearner, ConcurrencyLearner, scoreCandidate } from './adaptive-distribution.js';
 import { safeLine } from './safe-text.js';
 /** @typedef {import('./session-tracker.js').Observation} Observation */
-import { VALID_ROUTING_STRATEGIES } from './config.js';
+import { VALID_ROUTING_STRATEGIES, normalizeFinalWindowHours } from './config.js';
 
 // Re-exported for callers that import these model helpers from here.
 export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
@@ -412,8 +412,7 @@ export class AccountManager {
     // the reset is lost, and running out this close to it costs at most one
     // session window. 0 = off. Bounded to a day so a typo cannot turn balanced
     // into soonest-reset-first.
-    this.finalWindowHours = typeof finalWindowHours === 'number' && Number.isFinite(finalWindowHours)
-      && finalWindowHours >= 0 && finalWindowHours <= 24 ? finalWindowHours : 0;
+    this.finalWindowHours = normalizeFinalWindowHours(finalWindowHours);
     if (finalWindowHours !== undefined && finalWindowHours !== 0 && this.finalWindowHours === 0) {
       console.warn(`[TeamClaude] finalWindowHours ${finalWindowHours} is invalid (want 0..24); final-window preference is off`);
     }

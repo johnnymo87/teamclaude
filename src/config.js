@@ -121,6 +121,19 @@ export function validateRoutingConfig(config = {}) {
   };
 }
 
+/**
+ * Normalizes a finalWindowHours setting.
+ *
+ * An account whose weekly window resets within this many hours is spent first.
+ * Valid values are finite numbers in the range [0, 24]. Anything else falls back to 0 (off).
+ *
+ * @param {unknown} value
+ * @returns {number}
+ */
+export function normalizeFinalWindowHours(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 24 ? value : 0;
+}
+
 export function createDefaultConfig() {
   return {
     proxy: {
