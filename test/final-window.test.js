@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { AccountManager } from '../src/account-manager.js';
+import { AccountManager, FINAL_WINDOW_MIN_HEADROOM } from '../src/account-manager.js';
 
 const H = 3600_000;
 const OPUS = 'claude-opus-5';
@@ -294,5 +294,80 @@ test('final window: getStatus marginMove includes final_window counter', () => {
   const status = am.getStatus();
   assert.equal(typeof status.marginMove.final_window, 'number');
   assert.equal(status.marginMove.final_window, 1);
+});
+
+test('final window: entry headroom constant is exported with value 0.03', () => {
+  assert.equal(FINAL_WINDOW_MIN_HEADROOM, 0.03);
+});
+
+test('final window: entry headroom — 0.975 weekly not entered, 0.96 entered', () => {
+  // Switch threshold 1.0 -> headroom bound is 1.0 - 0.03 = 0.97
+  const am = new AccountManager([oauth('a'), oauth('b')], 1.0, {
+    routingStrategy: 'balanced', weeklyBalanceMargin: 0.10, finalWindowHours: 5,
+  });
+  bucket(am, 0, 'unified7d', 0.40, 50);
+  bucket(am, 1, 'unified7d', 0.975, 4);
+  am.currentIndex = 0;
+
+  // 0.975 > 0.97 -> entry headroom check fails, b does NOT qualify for final window
+  assert.equal(am._inFinalWindow(am.accounts[1]), false, '0.975 weekly exceeds threshold - 0.03 headroom');
+  assert.equal(am.getActiveAccount(null, OPUS).name, 'a');
+
+  // 0.96 <= 0.97 -> qualifies and enters final window
+  bucket(am, 1, 'unified7d', 0.96, 4);
+  assert.equal(am._inFinalWindow(am.accounts[1]), true, '0.96 weekly qualifies with >= 0.03 headroom');
+  assert.equal(am.getActiveAccount(null, OPUS).name, 'b');
+});
+
+test('final window: entry 5h guard — non-current at 5h 0.89 entered, at 0.90 not entered', () => {
+  const am = mk(['a', 'b']);
+  bucket(am, 0, 'unified7d', 0.40, 50);
+  bucket(am, 1, 'unified7d', 0.84, 4);
+  am.currentIndex = 0;
+
+  // 5h at 0.90 -> fails entry guard
+  am.accounts[1].quota.unified5h = 0.90;
+  assert.equal(am._inFinalWindow(am.accounts[1]), false, '5h 0.90 fails entry guard');
+  assert.equal(am.getActiveAccount(null, OPUS).name, 'a');
+
+  // 5h at 0.89 -> passes entry guard
+  am.accounts[1].quota.unified5h = 0.89;
+  assert.equal(am._inFinalWindow(am.accounts[1]), true, '5h 0.89 passes entry guard');
+  assert.equal(am.getActiveAccount(null, OPUS).name, 'b');
+});
+
+test('final window: hysteresis — current final account at 5h 0.93 stays final and cursor does not move', () => {
+  const am = mk(['a', 'b']);
+  bucket(am, 0, 'unified7d', 0.20, 50);
+  bucket(am, 1, 'unified7d', 0.84, 4);
+  am._setCurrent(am.accounts[1]);
+  assert.equal(am.currentIndex, 1);
+
+  // b is current; its 5h rises to 0.93 (above MARGIN_5H_GUARD 0.90, but below switch threshold 0.98)
+  am.accounts[1].quota.unified5h = 0.93;
+
+  // Entry guards do not apply to current account: stays final
+  assert.equal(am._inFinalWindow(am.accounts[1], am.accounts[1]), true);
+  const picked = am.getActiveAccount(null, OPUS);
+  assert.equal(picked.name, 'b', 'cursor must stay on current final account');
+  assert.equal(am.currentIndex, 1);
+});
+
+test('final window: current reaching the switch threshold leaves via the normal threshold switch', () => {
+  const am = mk(['a', 'b']);
+  bucket(am, 0, 'unified7d', 0.20, 50);
+  bucket(am, 1, 'unified7d', 0.84, 4);
+  am._setCurrent(am.accounts[1]);
+  assert.equal(am.currentIndex, 1);
+
+  // b reaches 5h switch threshold (0.98)
+  am.accounts[1].quota.unified5h = 0.98;
+  assert.equal(am.getActiveAccount(null, OPUS).name, 'a', 'reaches 5h threshold -> switches to a');
+
+  // Reset b's 5h, now b reaches weekly switch threshold (0.98)
+  am._setCurrent(am.accounts[1]);
+  am.accounts[1].quota.unified5h = 0.50;
+  am.accounts[1].quota.unified7d = 0.98;
+  assert.equal(am.getActiveAccount(null, OPUS).name, 'a', 'reaches weekly threshold -> switches to a');
 });
 

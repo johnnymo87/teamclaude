@@ -101,6 +101,8 @@ export const DEFAULT_SWITCH_THRESHOLD = 0.98;
 // clamp (>= 0.02), yet vastly larger than IEEE 754 float roundoff (~1e-16).
 export const MARGIN_FLOAT_EPSILON = 1e-9;
 export const MARGIN_5H_GUARD = 0.90;
+// Minimum weekly headroom required to enter the final window, avoiding cache rebuilds for negligible headroom.
+export const FINAL_WINDOW_MIN_HEADROOM = 0.03;
 
 // Quota fields that survive a restart: utilization levels and their reset
 // windows, learned passively from upstream responses. Transient/derived state
@@ -924,7 +926,9 @@ export class AccountManager {
    * provider partition, the expiry band. Returns the account or null.
    */
   pickAlternate(exclude, model = null, advisorModel = null, provider = DEFAULT_PROVIDER) {
-    return this._pickBestAvailable(this._excludeOtherProviders(exclude, provider), model, advisorModel);
+    const currentIndex = this._currentIndexForProvider(provider);
+    const current = currentIndex != null ? this.accounts[currentIndex] : null;
+    return this._pickBestAvailable(this._excludeOtherProviders(exclude, provider), model, advisorModel, current);
   }
 
   /**
@@ -1696,7 +1700,7 @@ export class AccountManager {
       const diverted = this._divertedFor(model);
       if (allowed(diverted)) return diverted.index;
     }
-    const best = this._pickBestAvailable(excluded, model);
+    const best = this._pickBestAvailable(excluded, model, null, current);
     return best ? best.index : null;
   }
 
@@ -2134,7 +2138,7 @@ export class AccountManager {
   _marginPreemptedBy(current, model = null, advisorModel = null, exclude = null, allW = null, { count = true } = {}) {
     if (!current || this.routingStrategy !== 'balanced') return null;
 
-    const best = this._pickBestAvailable(exclude, model, advisorModel);
+    const best = this._pickBestAvailable(exclude, model, advisorModel, current);
     if (!best || best.index === current.index) {
       if (count) this.marginMove.self_best++;
       return null;
@@ -2149,7 +2153,7 @@ export class AccountManager {
       return null;
     }
 
-    const finalMove = this._inFinalWindow(best, Date.now());
+    const finalMove = this._inFinalWindow(best, current, Date.now());
     if (!finalMove) {
       const wCurrent = curW?.value ?? 0;
       const wBest = W[best.index]?.value ?? 0;
@@ -2499,22 +2503,49 @@ export class AccountManager {
 
   /**
    * Whether the account is in its final weekly window: balanced strategy, knob
-   * on, the shared weekly window (unified7d) resets within finalWindowHours,
-   * and its 5h window is not near the margin spill guard. Availability is the
-   * caller's concern (candidates are already filtered). Unknown or past resets
-   * never qualify.
+   * on, the shared weekly window (unified7d) resets within finalWindowHours.
+   *
+   * For the CURRENT cursor account, entry guards do not apply: it stays final
+   * while available and its reset is in the window (hysteresis).
+   * For non-current accounts, entry additionally requires 5h < MARGIN_5H_GUARD
+   * and shared weekly utilization <= thresholdFor('unified7d', account) - FINAL_WINDOW_MIN_HEADROOM.
+   * Unknown utilization qualifies (headroom unknown, reset known).
+   *
    * @param {any} account
+   * @param {any} [current]
    * @param {number} [now]
    * @returns {boolean}
    */
-  _inFinalWindow(account, now = Date.now()) {
+  _inFinalWindow(account, current = null, now = Date.now()) {
+    if (typeof current === 'number') {
+      now = current;
+      current = null;
+    }
     if (!account || this.routingStrategy !== 'balanced' || !(this.finalWindowHours > 0)) return false;
-    const resetAt = this._governingWindow(account, null).resetAt;
+    const win = this._governingWindow(account, null);
+    const resetAt = win.resetAt;
     if (typeof resetAt !== 'number' || !Number.isFinite(resetAt)) return false;
     const left = resetAt - now;
     if (!(left > 0) || left > this.finalWindowHours * 3600_000) return false;
+
+    const isCurrent = typeof current === 'boolean'
+      ? current
+      : (current != null && (account === current || account.index === current.index));
+
+    if (isCurrent) {
+      return this._isAvailable(account);
+    }
+
     const u5h = account.quota?.unified5h;
-    return u5h == null || u5h < MARGIN_5H_GUARD;
+    if (u5h != null && u5h >= MARGIN_5H_GUARD) return false;
+
+    const u7d = win.utilization;
+    if (u7d != null) {
+      const threshold = this.thresholdFor('unified7d', account);
+      if (u7d > threshold - FINAL_WINDOW_MIN_HEADROOM + MARGIN_FLOAT_EPSILON) return false;
+    }
+
+    return true;
   }
 
   /**
@@ -2626,9 +2657,10 @@ export class AccountManager {
       const allW = this._computeAllW();
       const candidateW = candidates.map(a => allW[a.index]?.value ?? 0);
       const minW = Math.min(...candidateW);
+      const current = this.accounts[this.currentIndex] ?? null;
       const out = [];
       for (let i = 0; i < candidates.length; i++) {
-        if (this._inFinalWindow(candidates[i], now)) {
+        if (this._inFinalWindow(candidates[i], current, now)) {
           out.push(-1);
         } else {
           const w = candidateW[i];
@@ -3693,8 +3725,13 @@ export class AccountManager {
    * highest pressure, and the two part only where a timestamp alone would rank a
    * nearly-drained account resetting in an hour over one holding 20x the quota
    * that expires in ten.
+   * @param {Set<number>|null} [exclude]
+   * @param {string|null} [model]
+   * @param {string|null} [advisorModel]
+   * @param {any} [current]
+   * @returns {any}
    */
-  _pickBestAvailable(exclude = null, model = null, advisorModel = null) {
+  _pickBestAvailable(exclude = null, model = null, advisorModel = null, current = null) {
     let best = null;
     let bestPriority = Infinity;
     let bestFinal = Infinity;
@@ -3708,7 +3745,7 @@ export class AccountManager {
     const pressures = this._rankedPressures(candidates, model, now);
     candidates.forEach((account, i) => {
       const priority = account.priority || 0;
-      const finalKey = this._inFinalWindow(account, now) ? 0 : 1;
+      const finalKey = this._inFinalWindow(account, current, now) ? 0 : 1;
       const sharedReset = this._governingWindow(account, null).resetAt ?? Infinity;
       const pressure = pressures[i];
       // Rank by the reset of the weekly window that governs THIS model (Fable and
@@ -3760,7 +3797,8 @@ export class AccountManager {
     // preemption in _select), preselected is accepted directly so an intervening
     // state change (e.g. throttle expiring between preemption check and cursor move)
     // cannot divert the cursor onto an account with an untested W gap (D4 precondition 4).
-    const best = preselected ?? this._pickBestAvailable(exclude, model, advisorModel);
+    const current = this.accounts[this.currentIndex] ?? null;
+    const best = preselected ?? this._pickBestAvailable(exclude, model, advisorModel, current);
     if (best) {
       const previous = this._previousCursor(model, advisorModel);
       const switched = previous != null && previous !== best.index;
@@ -4714,7 +4752,7 @@ export class AccountManager {
         // Distinguishes a local threshold decision from an upstream rejection —
         // without it the two are indistinguishable in status output (#166).
         unavailable: this.unavailableReason(a),
-        finalWindow: this.unavailableReason(a) == null && this._inFinalWindow(a, now),
+        finalWindow: this.unavailableReason(a) == null && this._inFinalWindow(a, this.accounts[this.currentIndex], now),
         sessions: sessions.perAccount[a.index] || 0,
         knownSessions: sessions.knownPerAccount[a.index] || 0,
         // Shared-weekly pressure (model-agnostic), so the ordering the router
