@@ -103,6 +103,8 @@ export const MARGIN_FLOAT_EPSILON = 1e-9;
 export const MARGIN_5H_GUARD = 0.90;
 // Minimum weekly headroom required to enter the final window, avoiding cache rebuilds for negligible headroom.
 export const FINAL_WINDOW_MIN_HEADROOM = 0.03;
+// Three 300 s probe cycles to learn quota after weekly reset before cursor can move.
+export const RESET_HOLD_MS = 15 * 60_000;
 
 // Quota fields that survive a restart: utilization levels and their reset
 // windows, learned passively from upstream responses. Transient/derived state
@@ -2148,12 +2150,16 @@ export class AccountManager {
 
     const W = allW || this._computeAllW();
     const curW = W[current.index];
-    if (this.finalWindowHours > 0 && (curW?.provenance === 'median' || curW?.provenance === 'empty')) {
+    const now = Date.now();
+    if (this.finalWindowHours > 0
+      && (curW?.provenance === 'median' || curW?.provenance === 'empty')
+      && current.weeklyClearedAt != null
+      && now - current.weeklyClearedAt < RESET_HOLD_MS) {
       if (count) this.marginMove.held_imputed++;
       return null;
     }
 
-    const finalMove = this._inFinalWindow(best, current, Date.now());
+    const finalMove = this._inFinalWindow(best, { current, now });
     if (!finalMove) {
       const wCurrent = curW?.value ?? 0;
       const wBest = W[best.index]?.value ?? 0;
@@ -2220,7 +2226,7 @@ export class AccountManager {
     const providerExclude = this._excludeOtherProviders(null, providerOf(account));
     const marginPreemptor = this._marginPreemptedBy(account, null, null, providerExclude, null, { count: false });
     if (marginPreemptor) {
-      const isFinal = this._inFinalWindow(marginPreemptor, account);
+      const isFinal = this._inFinalWindow(marginPreemptor, { current: account });
       const reason = isFinal
         ? `outranked by final-window account "${marginPreemptor.name}"`
         : `outranked on weekly balance by "${marginPreemptor.name}"`;
@@ -2516,15 +2522,10 @@ export class AccountManager {
    * Unknown utilization qualifies (headroom unknown, reset known).
    *
    * @param {any} account
-   * @param {any} [current]
-   * @param {number} [now]
+   * @param {{ current?: any, now?: number }} [options]
    * @returns {boolean}
    */
-  _inFinalWindow(account, current = null, now = Date.now()) {
-    if (typeof current === 'number') {
-      now = current;
-      current = null;
-    }
+  _inFinalWindow(account, { current = null, now = Date.now() } = {}) {
     if (!account || this.routingStrategy !== 'balanced' || !(this.finalWindowHours > 0)) return false;
     const win = this._governingWindow(account, null);
     const resetAt = win.resetAt;
@@ -2532,9 +2533,7 @@ export class AccountManager {
     const left = resetAt - now;
     if (!(left > 0) || left > this.finalWindowHours * 3600_000) return false;
 
-    const isCurrent = typeof current === 'boolean'
-      ? current
-      : (current != null && (account === current || account.index === current.index));
+    const isCurrent = current != null && (account === current || account.index === current.index);
 
     if (isCurrent) {
       return this._isAvailable(account);
@@ -2661,10 +2660,19 @@ export class AccountManager {
       const allW = this._computeAllW();
       const candidateW = candidates.map(a => allW[a.index]?.value ?? 0);
       const minW = Math.min(...candidateW);
-      const current = this.accounts[this.currentIndex] ?? null;
+      const currentByProvider = new Map();
+      const getCurrentFor = (account) => {
+        const p = providerOf(account);
+        if (!currentByProvider.has(p)) {
+          const idx = this._currentIndexForProvider(p);
+          currentByProvider.set(p, idx != null ? this.accounts[idx] ?? null : null);
+        }
+        return currentByProvider.get(p);
+      };
       const out = [];
       for (let i = 0; i < candidates.length; i++) {
-        if (this._inFinalWindow(candidates[i], current, now)) {
+        const current = getCurrentFor(candidates[i]);
+        if (this._inFinalWindow(candidates[i], { current, now })) {
           out.push(-1);
         } else {
           const w = candidateW[i];
@@ -3370,6 +3378,7 @@ export class AccountManager {
     }
     if (q.unified7d != null && q.unified7dReset && now >= q.unified7dReset) {
       console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" weekly quota reset`);
+      account.weeklyClearedAt = now;
       q.unified7d = null;
       q.unified7dReset = null;
       q.unifiedStatus = null;
@@ -3749,7 +3758,7 @@ export class AccountManager {
     const pressures = this._rankedPressures(candidates, model, now);
     candidates.forEach((account, i) => {
       const priority = account.priority || 0;
-      const finalKey = this._inFinalWindow(account, current, now) ? 0 : 1;
+      const finalKey = this._inFinalWindow(account, { current, now }) ? 0 : 1;
       const sharedReset = this._governingWindow(account, null).resetAt ?? Infinity;
       const pressure = pressures[i];
       // Rank by the reset of the weekly window that governs THIS model (Fable and
@@ -3801,7 +3810,9 @@ export class AccountManager {
     // preemption in _select), preselected is accepted directly so an intervening
     // state change (e.g. throttle expiring between preemption check and cursor move)
     // cannot divert the cursor onto an account with an untested W gap (D4 precondition 4).
-    const current = this.accounts[this.currentIndex] ?? null;
+    const provider = this._selectingProvider || (this.accounts[this.currentIndex] ? providerOf(this.accounts[this.currentIndex]) : DEFAULT_PROVIDER);
+    const currentIdx = this._currentIndexForProvider(provider);
+    const current = currentIdx != null ? this.accounts[currentIdx] : (this.accounts[this.currentIndex] ?? null);
     const best = preselected ?? this._pickBestAvailable(exclude, model, advisorModel, current);
     if (best) {
       const previous = this._previousCursor(model, advisorModel);
@@ -4756,7 +4767,10 @@ export class AccountManager {
         // Distinguishes a local threshold decision from an upstream rejection —
         // without it the two are indistinguishable in status output (#166).
         unavailable: this.unavailableReason(a),
-        finalWindow: this.unavailableReason(a) == null && this._inFinalWindow(a, this.accounts[this.currentIndex], now),
+        finalWindow: this.unavailableReason(a) == null && this._inFinalWindow(a, {
+          current: currentIndexes[providerOf(a)] != null ? this.accounts[currentIndexes[providerOf(a)]] : null,
+          now,
+        }),
         sessions: sessions.perAccount[a.index] || 0,
         knownSessions: sessions.knownPerAccount[a.index] || 0,
         // Shared-weekly pressure (model-agnostic), so the ordering the router

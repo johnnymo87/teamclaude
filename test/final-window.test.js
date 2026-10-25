@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { AccountManager, FINAL_WINDOW_MIN_HEADROOM } from '../src/account-manager.js';
+import { AccountManager, FINAL_WINDOW_MIN_HEADROOM, RESET_HOLD_MS } from '../src/account-manager.js';
 
 const H = 3600_000;
 const OPUS = 'claude-opus-5';
@@ -47,7 +47,7 @@ test('final window: off (0) and non-balanced strategies keep current ranking', (
     bucket(ref, 0, 'unified7d', 0.20, 50);
     bucket(ref, 1, 'unified7d', 0.84, 4);
     assert.equal(am._pickBestAvailable(null, OPUS).name, ref._pickBestAvailable(null, OPUS).name, JSON.stringify(opts));
-    assert.equal(am._inFinalWindow(am.accounts[1], Date.now()), false, JSON.stringify(opts));
+    assert.equal(am._inFinalWindow(am.accounts[1]), false, JSON.stringify(opts));
   }
 });
 
@@ -56,13 +56,13 @@ test('final window: boundaries — unknown, past, exactly at window edge, just b
   const a = am.accounts[0];
   const now = Date.now();
   bucket(am, 0, 'unified7d', 0.5, null, now);
-  assert.equal(am._inFinalWindow(a, now), false, 'unknown reset');
+  assert.equal(am._inFinalWindow(a, { now }), false, 'unknown reset');
   bucket(am, 0, 'unified7d', 0.5, -0.1, now);
-  assert.equal(am._inFinalWindow(a, now), false, 'reset in the past');
+  assert.equal(am._inFinalWindow(a, { now }), false, 'reset in the past');
   bucket(am, 0, 'unified7d', 0.5, 5, now);
-  assert.equal(am._inFinalWindow(a, now), true, 'exactly 5h');
+  assert.equal(am._inFinalWindow(a, { now }), true, 'exactly 5h');
   bucket(am, 0, 'unified7d', 0.5, 5.001, now);
-  assert.equal(am._inFinalWindow(a, now), false, 'just beyond');
+  assert.equal(am._inFinalWindow(a, { now }), false, 'just beyond');
 });
 
 test('final window: 5h guard — unified5h >= 0.90 disqualifies, below qualifies, unknown qualifies', () => {
@@ -70,11 +70,11 @@ test('final window: 5h guard — unified5h >= 0.90 disqualifies, below qualifies
   const a = am.accounts[0];
   bucket(am, 0, 'unified7d', 0.5, 3);
   a.quota.unified5h = 0.90;
-  assert.equal(am._inFinalWindow(a, Date.now()), false);
+  assert.equal(am._inFinalWindow(a), false);
   a.quota.unified5h = 0.89;
-  assert.equal(am._inFinalWindow(a, Date.now()), true);
+  assert.equal(am._inFinalWindow(a), true);
   a.quota.unified5h = null;
-  assert.equal(am._inFinalWindow(a, Date.now()), true);
+  assert.equal(am._inFinalWindow(a), true);
 });
 
 test('final window: sooner reset wins between two final-window accounts', () => {
@@ -130,7 +130,7 @@ test('final window: after the reset the account is ordinary again (no bounce)', 
   am.currentIndex = 1;
   bucket(am, 0, 'unified7d', 0.81, 50);
   bucket(am, 1, 'unified7d', 0.02, 168); // b just reset: low W, a week away
-  assert.equal(am._inFinalWindow(am.accounts[1], Date.now()), false);
+  assert.equal(am._inFinalWindow(am.accounts[1]), false);
   assert.equal(am.getActiveAccount(null, OPUS).name, 'b');
 });
 
@@ -199,9 +199,9 @@ test('final window: no bounce at weekly reset when current account W is imputed 
     am._setCurrent(a);
     assert.equal(am.currentIndex, 0);
 
-    // Simulate weekly reset expiration: unified7d cleared to null
-    a.quota.unified7d = null;
-    a.quota.unified7dReset = null;
+    // Simulate weekly reset expiration via _clearExpiredQuotas
+    a.quota.unified7dReset = Date.now() - 1000;
+    am._clearExpiredQuotas(a);
 
     const r1 = am.getActiveAccount(new Set(), OPUS).name;
     if (fw > 0) {
@@ -347,7 +347,7 @@ test('final window: hysteresis — current final account at 5h 0.93 stays final 
   am.accounts[1].quota.unified5h = 0.93;
 
   // Entry guards do not apply to current account: stays final
-  assert.equal(am._inFinalWindow(am.accounts[1], am.accounts[1]), true);
+  assert.equal(am._inFinalWindow(am.accounts[1], { current: am.accounts[1] }), true);
   const picked = am.getActiveAccount(null, OPUS);
   assert.equal(picked.name, 'b', 'cursor must stay on current final account');
   assert.equal(am.currentIndex, 1);
@@ -395,6 +395,117 @@ test('final window: eligibility reports outranked by final-window account', () =
   bucket(amOff, 1, 'unified7d', 0.20, 50); // b lower W by > margin 0.10
   assert.equal(amOff.eligibility(0).eligible, false);
   assert.equal(amOff.eligibility(0).reason, 'outranked on weekly balance by "b"');
+});
+
+test('final window: RESET_HOLD_MS is exported and equals 15 minutes', () => {
+  assert.equal(RESET_HOLD_MS, 15 * 60_000);
+});
+
+test('final window: _clearExpiredQuotas records account.weeklyClearedAt = now on weekly quota reset', () => {
+  const am = mk(['a']);
+  const a = am.accounts[0];
+  const now = 1_700_000_000_000;
+  a.quota.unified7d = 0.90;
+  a.quota.unified7dReset = now - 1000;
+  assert.equal(a.weeklyClearedAt, undefined);
+  am._clearExpiredQuotas(a);
+  assert.equal(typeof a.weeklyClearedAt, 'number');
+  assert.ok(Math.abs(a.weeklyClearedAt - Date.now()) < 5000);
+});
+
+test('final window: held_imputed bounds hold in time and skips accounts without reset clear', () => {
+  // 5 accounts: a (current, high W), b..e with lower W
+  const setup = (weeklyClearedAt = null) => {
+    const am = new AccountManager(['a', 'b', 'c', 'd', 'e'].map(n => oauth(n)), 0.98, {
+      routingStrategy: 'balanced', weeklyBalanceMargin: 0.10, finalWindowHours: 5,
+    });
+    for (const acct of am.accounts) acct.probing = false;
+    const a = am.accounts[0];
+    bucket(am, 0, 'unified7d', null, null); // a has imputed W (empty/median)
+    bucket(am, 1, 'unified7d', 0.88, 85);
+    bucket(am, 2, 'unified7d', 0.89, 30);
+    bucket(am, 3, 'unified7d', 0.26, 144);
+    bucket(am, 4, 'unified7d', 0.22, 125);
+    am._setCurrent(a);
+    if (weeklyClearedAt != null) a.weeklyClearedAt = weeklyClearedAt;
+    return am;
+  };
+
+  const now = Date.now();
+
+  // 1. Inside RESET_HOLD_MS bound (e.g. cleared 2 minutes ago): hold cursor on a
+  const amInside = setup(now - 2 * 60_000);
+  assert.equal(amInside.getActiveAccount(new Set(), OPUS).name, 'a', 'inside RESET_HOLD_MS: holds on a');
+  assert.equal(amInside.marginMove.held_imputed, 1);
+
+  // 2. After RESET_HOLD_MS bound (e.g. cleared 16 minutes ago): cursor margin-moves to e
+  const amAfter = setup(now - 16 * 60_000);
+  assert.equal(amAfter.getActiveAccount(new Set(), OPUS).name, 'e', 'after RESET_HOLD_MS: cursor moves to e');
+  assert.equal(amAfter.marginMove.held_imputed, 0);
+
+  // 3. Never had a reset clear (weeklyClearedAt is null/undefined): cursor margin-moves to e
+  const amNever = setup(null);
+  assert.equal(amNever.getActiveAccount(new Set(), OPUS).name, 'e', 'never cleared: cursor moves to e');
+  assert.equal(amNever.marginMove.held_imputed, 0);
+});
+
+test('final window: _inFinalWindow takes { current, now } options object without positional overloads', () => {
+  const am = mk(['a', 'b']);
+  const now = Date.now();
+  bucket(am, 0, 'unified7d', 0.84, 4, now);
+  const a = am.accounts[0];
+
+  // Default options
+  assert.equal(am._inFinalWindow(a), true);
+
+  // Passing now in options
+  assert.equal(am._inFinalWindow(a, { now: now + 5 * H }), false);
+  assert.equal(am._inFinalWindow(a, { now }), true);
+
+  // Passing current in options
+  a.quota.unified5h = 0.93; // Above 0.90 entry guard
+  // If not current, fails 5h guard:
+  assert.equal(am._inFinalWindow(a, { current: null }), false);
+  // If current, hysteresis applies and passes:
+  assert.equal(am._inFinalWindow(a, { current: a }), true);
+});
+
+test('final window: multi-provider current resolution for getStatus and _belowBandFloor', () => {
+  const codex = (name) => oauth(name, { provider: 'codex', accountId: 'acct-' + name });
+  const am = new AccountManager([
+    oauth('ant-0'),
+    codex('cod-1'),
+    codex('cod-2'),
+  ], 0.98, {
+    routingStrategy: 'balanced',
+    weeklyBalanceMargin: 0.10,
+    finalWindowHours: 5,
+  });
+
+  const now = Date.now();
+  // ant-0 is Anthropic cursor (index 0)
+  bucket(am, 0, 'unified7d', 0.50, 50, now);
+  am.currentIndex = 0;
+
+  // cod-1 is Codex cursor (index 1), with 5h = 0.93 (above 0.90 entry guard, below 0.98 threshold)
+  // and weekly resetting in 3h
+  bucket(am, 1, 'unified7d', 0.84, 3, now);
+  am.accounts[1].quota.unified5h = 0.93;
+  // cod-2 has weekly resetting in 50h
+  bucket(am, 2, 'unified7d', 0.40, 50, now);
+
+  // Set Codex provider cursor to cod-1
+  am.providerCursors.set('codex', 1);
+
+  // In getStatus, cod-1 should be recognized as current Codex cursor (hysteresis applies) -> finalWindow: true
+  const status = am.getStatus();
+  assert.equal(status.accounts[1].finalWindow, true, 'cod-1 is current for codex so hysteresis keeps finalWindow true');
+  assert.equal(status.accounts[2].finalWindow, false);
+
+  // In _belowBandFloor, cod-1 should receive -1
+  const floorScores = am._belowBandFloor([am.accounts[1], am.accounts[2]], null, now);
+  assert.equal(floorScores[0], -1, 'current codex account in final window gets -1 score');
+  assert.equal(floorScores[1], 0);
 });
 
 
