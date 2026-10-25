@@ -589,3 +589,37 @@ test('renderStatus strips control characters out of account and route strings', 
   assert.match(output, /pinned: a/);
   assert.equal(output.split('\n').filter(l => /forged/.test(l)).length, 1);   // no forged line
 });
+
+test('renderStatus prints Final line for an account in its final window', () => {
+  const status = sampleStatus();
+  status.accounts[0].finalWindow = true;
+  // 4 hours and 12 minutes until reset
+  status.accounts[0].quota.unified7dReset = now + (4 * 3600 + 12 * 60) * 1000;
+
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /Final\s+weekly resets in 4h12m — used first until then/);
+});
+
+test('renderStatus tolerates missing finalWindow or expired reset without printing Final line', () => {
+  // 1. Missing finalWindow (e.g. older server)
+  const statusOld = sampleStatus();
+  delete statusOld.accounts[0].finalWindow;
+  statusOld.accounts[0].quota.unified7dReset = now + 4 * 3600 * 1000;
+  const outOld = renderStatus(statusOld, { color: false, now });
+  assert.doesNotMatch(outOld, /Final/);
+
+  // 2. finalWindow false
+  const statusFalse = sampleStatus();
+  statusFalse.accounts[0].finalWindow = false;
+  statusFalse.accounts[0].quota.unified7dReset = now + 4 * 3600 * 1000;
+  const outFalse = renderStatus(statusFalse, { color: false, now });
+  assert.doesNotMatch(outFalse, /Final/);
+
+  // 3. finalWindow true but reset is missing or in the past
+  const statusPast = sampleStatus();
+  statusPast.accounts[0].finalWindow = true;
+  statusPast.accounts[0].quota.unified7dReset = now - 1000;
+  const outPast = renderStatus(statusPast, { color: false, now });
+  assert.doesNotMatch(outPast, /Final/);
+});
+

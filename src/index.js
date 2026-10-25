@@ -5,7 +5,7 @@ import { createInterface } from 'node:readline';
 import { createWriteStream } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import net from 'node:net';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState, validateRoutingConfig } from './config.js';
+import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState, validateRoutingConfig, normalizeFinalWindowHours } from './config.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
@@ -297,6 +297,7 @@ async function serverCommand() {
     adaptive,
     routingStrategy: config.routingStrategy,
     weeklyBalanceMargin: config.weeklyBalanceMargin,
+    finalWindowHours: config.finalWindowHours,
   });
   // Names the activity log's session column from Claude Code's own on-disk
   // session titles. Built whether or not the TUI runs, so a reload has one
@@ -418,6 +419,12 @@ async function serverCommand() {
     if (!diskConfig) return 0;
     if (diskConfig.routingStrategy && diskConfig.routingStrategy !== accountManager.routingStrategy) {
       console.log('[TeamClaude] routingStrategy change requires a restart');
+    }
+    const diskFinalWindow = normalizeFinalWindowHours(diskConfig.finalWindowHours);
+    if (diskFinalWindow !== accountManager.finalWindowHours) {
+      console.log(`[TeamClaude] finalWindowHours changed: ${accountManager.finalWindowHours} -> ${diskFinalWindow}`);
+      accountManager.finalWindowHours = diskFinalWindow;
+      config.finalWindowHours = diskFinalWindow;
     }
     const added = await syncAccountsFromDisk(diskConfig, config, accountManager);
     // Pick up client-key edits (proxy.clientKeys is read live by both auth
@@ -680,7 +687,7 @@ async function serverCommand() {
     // Log the resolved routing strategy and expiry routing state. They are
     // orthogonal switches, not a precedence (design D1): every combination
     // is live, so the operator needs to see which combination is active.
-    console.log(`[TeamClaude] Routing: strategy=${accountManager.routingStrategy}, expiryRouting.enabled=${accountManager.expiryRouting.enabled}`);
+    console.log(`[TeamClaude] Routing: strategy=${accountManager.routingStrategy}, expiryRouting.enabled=${accountManager.expiryRouting.enabled}, finalWindowHours=${accountManager.finalWindowHours}`);
     if (tui) {
       const held = earlyConsole?.release() ?? [];
       tui.start();

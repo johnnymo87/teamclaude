@@ -2,11 +2,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
 import { spawn } from 'node:child_process';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createDefaultConfig, validateRoutingConfig, VALID_ROUTING_STRATEGIES } from '../src/config.js';
+import { createDefaultConfig, validateRoutingConfig, VALID_ROUTING_STRATEGIES, normalizeFinalWindowHours } from '../src/config.js';
 import { AccountManager } from '../src/account-manager.js';
 
 const cliPath = fileURLToPath(new URL('../src/index.js', import.meta.url));
@@ -93,6 +93,17 @@ test('validateRoutingConfig rejects balanced strategy when quotaProbeSeconds is 
       () => validateRoutingConfig({ routingStrategy: 'balanced', quotaProbeSeconds: invalidProbe }),
       /"balanced" routing strategy requires "quotaProbeSeconds" > 0/
     );
+  }
+});
+
+test('normalizeFinalWindowHours accepts numbers in [0, 24] and falls back to 0', () => {
+  assert.equal(normalizeFinalWindowHours(0), 0);
+  assert.equal(normalizeFinalWindowHours(5), 5);
+  assert.equal(normalizeFinalWindowHours(12.5), 12.5);
+  assert.equal(normalizeFinalWindowHours(24), 24);
+
+  for (const invalid of [-1, -0.1, 24.01, 25, NaN, Infinity, -Infinity, '5', '', null, undefined, {}, [], true, false]) {
+    assert.equal(normalizeFinalWindowHours(invalid), 0, `invalid=${String(invalid)}`);
   }
 });
 
@@ -300,3 +311,110 @@ test('config reload logs restart requirement on routingStrategy change and does 
     await new Promise(r => child.on('exit', r));
   }
 });
+
+test('startup logs finalWindowHours and passes config value to AccountManager', async () => {
+  const port = await closedPort();
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-fw-'));
+  const configPath = join(dir, 'config.json');
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: 'https://api.anthropic.com',
+    routingStrategy: 'balanced',
+    quotaProbeSeconds: 90,
+    finalWindowHours: 5,
+    accounts: [{ name: 'acct1', type: 'apikey', apiKey: 'sk-ant-test' }],
+  }));
+
+  const child = spawn(process.execPath, [cliPath, 'server', '--headless'], {
+    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath, TEAMCLAUDE_DISABLE_AUTOUPDATE: '1' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  let output = '';
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', c => { output += c; });
+  child.stderr.on('data', c => { output += c; });
+
+  try {
+    for (let i = 0; i < 50; i++) {
+      if (output.includes('TeamClaude Proxy') || output.includes('Listening on port')) break;
+      await new Promise(r => setTimeout(r, 100));
+    }
+    assert.match(output, /Routing: strategy=balanced, expiryRouting\.enabled=false, finalWindowHours=5/);
+
+    const res = await fetch(`http://127.0.0.1:${port}/teamclaude/status`);
+    assert.equal(res.status, 200);
+    const status = await res.json();
+    assert.equal(status.finalWindowHours, 5);
+  } finally {
+    child.kill('SIGTERM');
+    await new Promise(r => child.on('exit', r));
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('config reload applies finalWindowHours live and logs the change', async () => {
+  const port = await closedPort();
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-fw-reload-'));
+  const configPath = join(dir, 'config.json');
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: 'https://api.anthropic.com',
+    routingStrategy: 'balanced',
+    quotaProbeSeconds: 90,
+    finalWindowHours: 5,
+    accounts: [{ name: 'acct1', type: 'apikey', apiKey: 'sk-ant-test' }],
+  }));
+
+  const child = spawn(process.execPath, [cliPath, 'server', '--headless'], {
+    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath, TEAMCLAUDE_DISABLE_AUTOUPDATE: '1' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  let output = '';
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', c => { output += c; });
+  child.stderr.on('data', c => { output += c; });
+
+  try {
+    for (let i = 0; i < 50; i++) {
+      if (output.includes('TeamClaude Proxy') || output.includes('Listening on port')) break;
+      await new Promise(r => setTimeout(r, 100));
+    }
+
+    // Update config on disk to different finalWindowHours
+    await writeFile(configPath, JSON.stringify({
+      proxy: { port, apiKey: 'tc-test' },
+      upstream: 'https://api.anthropic.com',
+      routingStrategy: 'balanced',
+      quotaProbeSeconds: 90,
+      finalWindowHours: 0,
+      accounts: [{ name: 'acct1', type: 'apikey', apiKey: 'sk-ant-test' }],
+    }));
+
+    // Trigger reload
+    const res = await fetch(`http://127.0.0.1:${port}/teamclaude/reload`, { method: 'POST' });
+    assert.equal(res.status, 200);
+
+    // Give stdout a moment to flush
+    for (let i = 0; i < 20; i++) {
+      if (output.includes('finalWindowHours changed: 5 -> 0')) break;
+      await new Promise(r => setTimeout(r, 50));
+    }
+
+    assert.match(output, /\[TeamClaude\] finalWindowHours changed: 5 -> 0/);
+
+    // Verify /teamclaude/status reflects the updated finalWindowHours live
+    const statusRes = await fetch(`http://127.0.0.1:${port}/teamclaude/status`);
+    assert.equal(statusRes.status, 200);
+    const status = await statusRes.json();
+    assert.equal(status.finalWindowHours, 0);
+  } finally {
+    child.kill('SIGTERM');
+    await new Promise(r => child.on('exit', r));
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
