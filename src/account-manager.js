@@ -3650,6 +3650,17 @@ export class AccountManager {
   static get PLAN_LESS_MIN_SILENT_PROBES() { return 3; }
 
   /**
+   * True for a seat whose plan carries no quota buckets and is metered purely
+   * in money — today Claude Enterprise's `enterprise_usage_based` seat tier,
+   * read from the profile at login. Matched on the `usage_based` suffix so a
+   * sibling tier of the same kind is recognised without a release.
+   * @param {{ seatTier?: string | null } | null | undefined} account
+   */
+  static isUsageBasedSeat(account) {
+    return /usage_based$/i.test(String(account?.seatTier || ''));
+  }
+
+  /**
    * True when an account looks like it carries no plan: every weekly bucket
    * unreported AND no 5h consumption visible.
    *
@@ -3676,6 +3687,13 @@ export class AccountManager {
       && q.unified7dFable == null
       && (q.unified5h == null || q.unified5h === 0);
     if (!silent) return false;
+    // A usage-based seat (Claude Enterprise `seat_tier: enterprise_usage_based`)
+    // has no plan buckets BY DESIGN: every bucket reads null and the seat is
+    // metered entirely in money. Silence there means "billed, not bucketed",
+    // the opposite of a lapsed plan, so it is exempt while billing is on or not
+    // yet reported. Only an explicit "billing off" from the probe re-arms the
+    // gate, and then correctly: no plan and no billing means it cannot serve.
+    if (AccountManager.isUsageBasedSeat(account) && q.spend?.enabled !== false) return false;
     // Sustained, not instantaneous: only condemn an account after several
     // consecutive probes have come back silent. An account that has never been
     // probed has silentProbes 0 and is left alone.

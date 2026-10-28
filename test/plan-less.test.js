@@ -107,3 +107,51 @@ test('a single reporting probe rehabilitates an account immediately', () => {
   am.applyUsageData(0, { sevenDay: { utilization: 0.05 } });
   assert.equal(am._isAvailable(am.accounts[0]), true, 'resubscribing must not need three probes to take effect');
 });
+
+/**
+ * A usage-based seat (Claude Enterprise `seat_tier: enterprise_usage_based`)
+ * has NO plan buckets by design: /api/oauth/usage reports every bucket null and
+ * meters the seat entirely through `extra_usage` / `spend`. Observed on a real
+ * Wonder Claude Enterprise seat 2026-10-28. It is silent for the same reason a
+ * lapsed Max is, but it is the opposite case: it serves, and bills.
+ */
+const ENTERPRISE = { organizationType: 'claude_enterprise', rateLimitTier: 'default_claude_zero', seatTier: 'enterprise_usage_based' };
+const BILLING = { enabled: true, usedMinor: 0, limitMinor: null, currency: 'USD', exponent: 2, userDisabled: false, disabledReason: null };
+
+test('a usage-based seat whose billing is enabled is never plan-less', () => {
+  const am = new AccountManager([oauth('ent', ENTERPRISE), oauth('live')]);
+  healthy(am, 1);
+  for (let n = 0; n < 5; n++) am.applyUsageData(0, { spend: { ...BILLING } });
+  assert.ok(am.accounts[0].silentProbes >= 3, 'precondition: it really is silent on every bucket');
+  assert.equal(am._isPlanLess(am.accounts[0]), false);
+  assert.equal(am._isAvailable(am.accounts[0]), true, 'a billing usage-based seat must stay selectable');
+});
+
+test('a usage-based seat whose billing upstream switched OFF is plan-less again', () => {
+  const am = new AccountManager([oauth('ent', ENTERPRISE), oauth('live')]);
+  healthy(am, 1);
+  for (let n = 0; n < 3; n++) {
+    am.applyUsageData(0, { spend: { ...BILLING, enabled: false, disabledReason: 'spend_limit_reached' } });
+  }
+  assert.equal(am._isAvailable(am.accounts[0]), false,
+    'with no plan and no billing it cannot serve; the gate is exactly right here');
+});
+
+test('a usage-based seat not yet probed for spend is left alone by the exemption', () => {
+  // Unknown billing is not evidence of no billing: the exemption applies while
+  // spend is unreported, so only an explicit "billing off" re-arms the gate.
+  const am = new AccountManager([oauth('ent', ENTERPRISE), oauth('live')]);
+  healthy(am, 1);
+  planLess(am, 0);
+  assert.equal(am._isAvailable(am.accounts[0]), true);
+});
+
+test('billing alone does not exempt a plan account: a lapsed Max with overage on is still plan-less', () => {
+  // Only a seat that is usage-based BY PLAN is exempt. A Max account that
+  // reports nothing is the lapsed-subscription case the gate exists for, and an
+  // overage flag left on does not change that.
+  const am = new AccountManager([oauth('lapsed', { organizationType: 'claude_max', seatTier: null }), oauth('live')]);
+  healthy(am, 1);
+  for (let n = 0; n < 3; n++) am.applyUsageData(0, { spend: { ...BILLING } });
+  assert.equal(am._isAvailable(am.accounts[0]), false);
+});
