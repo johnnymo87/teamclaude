@@ -105,6 +105,10 @@ export const MARGIN_5H_GUARD = 0.90;
 export const FINAL_WINDOW_MIN_HEADROOM = 0.03;
 // Three 300 s probe cycles to learn quota after weekly reset before cursor can move.
 export const RESET_HOLD_MS = 15 * 60_000;
+// A daily money cap fails CLOSED once spend has gone this long unread (about
+// four default probe cycles): a cap that cannot see spend must not keep
+// spending. See AccountManager.capExceeded.
+export const SPEND_READING_STALE_MS = 20 * 60_000;
 
 // Quota fields that survive a restart: utilization levels and their reset
 // windows, learned passively from upstream responses. Transient/derived state
@@ -193,7 +197,7 @@ function emptyQuota() {
     // month-to-date spend: { day: 'YYYY-MM-DD', spentMinor, lastUsedMinor,
     // exponent }. What accounts[].maxDailySpend is checked against. Persisted,
     // so spend while the daemon was down still counts toward that day.
-    dailySpend: /** @type {{ day: string, spentMinor: number, lastUsedMinor: number, exponent: number } | null} */ (null),
+    dailySpend: /** @type {{ day: string, spentMinor: number, lastUsedMinor: number, exponent: number, seenAt?: number } | null} */ (null),
     resetsAt: null,
   };
 }
@@ -659,8 +663,11 @@ export class AccountManager {
    * alone. Both apply: a Fable request is capped by whichever binds first.
    */
   capExceeded(account, model = null) {
-    // A daily money budget binds every model alike: it is one wallet.
+    // A daily money budget binds every model alike: it is one wallet. It fails
+    // closed: with a cap set and no recent spend reading (probe failing, turned
+    // off, or not run yet) the account is held rather than spending blind.
     if (this._dailySpendCapReached(account)) return 'dailySpend';
+    if (this._dailySpendUnknown(account)) return 'dailySpendUnknown';
     if (!account?.maxUsage) return null;
     const q = account.quota;
     // Same reason _isNearQuota does this first: a window that has already reset
@@ -2063,6 +2070,7 @@ export class AccountManager {
     // account at its cap receives no requests at all.
     const cap = this.capExceeded(account, model);
     if (cap === 'dailySpend') return 'spend-capped';
+    if (cap === 'dailySpendUnknown') return 'spend-unknown';
     if (cap) return 'capped';
 
     // A structured organization-policy 403 means this account cannot serve OAuth
@@ -3728,14 +3736,29 @@ export class AccountManager {
   }
 
   /**
+   * Whether a daily cap is set but spend has not been read recently enough to
+   * enforce it (never, or more than SPEND_READING_STALE_MS ago).
+   * @param {any} account
+   * @param {number} [now]
+   * @returns {boolean}
+   */
+  _dailySpendUnknown(account, now = Date.now()) {
+    if (account?.maxDailySpend == null) return false;
+    const seenAt = account.quota?.dailySpend?.seenAt;
+    return typeof seenAt !== 'number' || now - seenAt > SPEND_READING_STALE_MS;
+  }
+
+  /**
    * Fold one month-to-date spend reading into the per-day tracker.
    *
    * The day's spend is the sum of INCREASES between consecutive readings since
    * local midnight. The very first reading is only a baseline: what was spent
    * earlier that day, before anything was watching, cannot be told apart from
    * what was spent earlier in the month, so it is not counted. A reading BELOW
-   * the previous one means the billing month rolled over, and everything in it
-   * is new spend. An increase straddling midnight counts toward the new day,
+   * the previous one is a billing-month rollover (everything in it is new
+   * spend) only when the calendar month changed since the last reading or the
+   * figure fell to under half; any other dip is a revision, and re-baselines
+   * with nothing counted rather than charging the whole month to today. An increase straddling midnight counts toward the new day,
    * the side that keeps a cap conservative.
    *
    * Overshoot is bounded by one probe interval: spend is only visible through
@@ -3751,13 +3774,22 @@ export class AccountManager {
     const today = AccountManager.spendDayKey(now);
     const t = q.dailySpend;
     if (!t || typeof t.lastUsedMinor !== 'number') {
-      q.dailySpend = { day: today, spentMinor: 0, lastUsedMinor: usedMinor, exponent };
+      q.dailySpend = { day: today, spentMinor: 0, lastUsedMinor: usedMinor, exponent, seenAt: now };
       return;
     }
     const wasCapped = this._dailySpendCapReached(account, now);
-    const delta = usedMinor >= t.lastUsedMinor ? usedMinor - t.lastUsedMinor : usedMinor;
+    let delta;
+    if (usedMinor >= t.lastUsedMinor) {
+      delta = usedMinor - t.lastUsedMinor;
+    } else {
+      const prev = typeof t.seenAt === 'number' ? new Date(t.seenAt) : null;
+      const cur = new Date(now);
+      const monthChanged = !prev
+        || prev.getMonth() !== cur.getMonth() || prev.getUTCMonth() !== cur.getUTCMonth();
+      delta = (monthChanged || usedMinor < t.lastUsedMinor / 2) ? usedMinor : 0;
+    }
     const base = t.day === today ? (t.spentMinor || 0) : 0;
-    q.dailySpend = { day: today, spentMinor: base + delta, lastUsedMinor: usedMinor, exponent };
+    q.dailySpend = { day: today, spentMinor: base + delta, lastUsedMinor: usedMinor, exponent, seenAt: now };
     if (!wasCapped && this._dailySpendCapReached(account, now)) {
       console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" reached its daily spend cap: ${formatMoney({ usedMinor: q.dailySpend.spentMinor, limitMinor: Math.round(account.maxDailySpend * 10 ** exponent), currency: q.spend?.currency || null, exponent })} today; out of rotation until local midnight`);
     }

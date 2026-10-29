@@ -69,10 +69,10 @@ test('a capped seat is skipped even by the all-unavailable probe path (hard cap,
 });
 
 test('local midnight resets the day; the cap lifts without waiting for a probe', () => {
-  withClock(at(2026, 11, 3, 22), (set) => {
+  withClock(at(2026, 11, 3, 23, 50), (set) => {
     const am = fleet(10);
     am.applyUsageData(1, spend(0));
-    set(at(2026, 11, 3, 23)); am.applyUsageData(1, spend(12_00));
+    set(at(2026, 11, 3, 23, 55)); am.applyUsageData(1, spend(12_00));
     assert.equal(am.unavailableReason(am.accounts[1]), 'spend-capped');
     set(at(2026, 11, 4, 0, 1));
     assert.equal(am.dailySpendMinor(am.accounts[1]), 0, 'a new day starts at zero');
@@ -162,4 +162,47 @@ test('the Spend line shows today against the cap, and the unavailable reason nam
   assert.match(spendLine({ ...row, maxDailySpend: null }, paint), /today \$12\.34$/);
   assert.doesNotMatch(spendLine({ ...row, dailySpend: null }, paint), /today/);
   assert.match(UNAVAILABLE_TEXT['spend-capped'], /maxDailySpend/);
+});
+
+test('fails CLOSED when spend readings stop: no reading for 20 minutes bars a capped seat', () => {
+  withClock(at(2026, 11, 3, 9), (set) => {
+    const am = fleet(100);
+    am.applyUsageData(1, spend(0));
+    set(at(2026, 11, 3, 9, 19));
+    assert.equal(am.unavailableReason(am.accounts[1]), null);
+    set(at(2026, 11, 3, 9, 21));
+    assert.equal(am.unavailableReason(am.accounts[1]), 'spend-unknown',
+      'a money cap that can no longer see spend must not keep spending');
+    am.applyUsageData(1, spend(1_00));
+    assert.equal(am.unavailableReason(am.accounts[1]), null, 'the next reading restores it');
+  });
+});
+
+test('a capped seat with no reading yet is held until its first probe; an uncapped one is not', () => {
+  const capped = fleet(100);
+  assert.equal(capped.unavailableReason(capped.accounts[1]), 'spend-unknown');
+  const uncapped = fleet(undefined);
+  assert.equal(uncapped.unavailableReason(uncapped.accounts[1]), null);
+});
+
+test('a small downward revision mid-month re-baselines instead of reading as a new month', () => {
+  withClock(at(2026, 11, 20, 9), (set) => {
+    const am = fleet(100);
+    am.applyUsageData(1, spend(900_00));
+    set(at(2026, 11, 20, 9, 5)); am.applyUsageData(1, spend(899_99));
+    assert.equal(am.dailySpendMinor(am.accounts[1]), 0);
+    assert.equal(am.unavailableReason(am.accounts[1]), null);
+    set(at(2026, 11, 20, 9, 10)); am.applyUsageData(1, spend(902_00));
+    assert.equal(am.dailySpendMinor(am.accounts[1]), 2_01, 'measured from the revised reading');
+  });
+});
+
+test('a drop to below half the previous reading is a rollover even within a calendar month', () => {
+  // Billing months need not align with calendar months.
+  withClock(at(2026, 11, 14, 9), (set) => {
+    const am = fleet(100);
+    am.applyUsageData(1, spend(800_00));
+    set(at(2026, 11, 14, 9, 5)); am.applyUsageData(1, spend(2_00));
+    assert.equal(am.dailySpendMinor(am.accounts[1]), 2_00);
+  });
 });

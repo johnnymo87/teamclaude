@@ -142,6 +142,7 @@ export const UNAVAILABLE_TEXT = {
   quota: 'local switch threshold reached',
   capped: 'account usage cap reached (maxUsage)',
   'spend-capped': 'daily spend cap reached (maxDailySpend); back at local midnight',
+  'spend-unknown': 'daily spend cap set but spend unread for 20+ min (probe failing or off)',
   'advisor-capped': "advisor model's usage cap reached (maxUsage)",
   entitlement: 'upstream refused this account for the organization (cooldown)',
   route: 'no route allows this account',
