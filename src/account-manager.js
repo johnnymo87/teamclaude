@@ -105,6 +105,10 @@ export const MARGIN_5H_GUARD = 0.90;
 export const FINAL_WINDOW_MIN_HEADROOM = 0.03;
 // Three 300 s probe cycles to learn quota after weekly reset before cursor can move.
 export const RESET_HOLD_MS = 15 * 60_000;
+// A daily money cap fails CLOSED once spend has gone this long unread (about
+// four default probe cycles): a cap that cannot see spend must not keep
+// spending. See AccountManager.capExceeded.
+export const SPEND_READING_STALE_MS = 20 * 60_000;
 
 // Quota fields that survive a restart: utilization levels and their reset
 // windows, learned passively from upstream responses. Transient/derived state
@@ -122,6 +126,10 @@ const PERSISTED_QUOTA_FIELDS = [
   // until something next reads /wham/usage — and the row that says so is the
   // only place an operator sees one at all.
   'resetCredits',
+  // The per-day spend tracker behind accounts[].maxDailySpend. Persisted so a
+  // restart neither forgets the day's spend nor loses the last reading the
+  // next increase is measured from.
+  'dailySpend',
 ];
 
 // The family (Fable/Sonnet) weekly buckets and the field holding when each was
@@ -185,6 +193,11 @@ function emptyQuota() {
     // Not a quota — it says whether exceeding the quotas above costs money
     // on this account rather than stopping it.
     spend: null,
+    // Money billed per local calendar day, accumulated from the probe's
+    // month-to-date spend: { day: 'YYYY-MM-DD', spentMinor, lastUsedMinor,
+    // exponent }. What accounts[].maxDailySpend is checked against. Persisted,
+    // so spend while the daemon was down still counts toward that day.
+    dailySpend: /** @type {{ day: string, spentMinor: number, lastUsedMinor: number, exponent: number, seenAt?: number } | null} */ (null),
     resetsAt: null,
   };
 }
@@ -213,6 +226,23 @@ export function accountSwitchThreshold(acct) {
     console.log(`[TeamClaude] Account "${safeLine(acct?.name, 64)}": ignoring ${safeLine(rejected.join(', '), 160)} — a switch threshold must be a number above 0 and at most 1 (0.98 means 98%)`);
   }
   return value;
+}
+
+/**
+ * The per-account daily spend cap an account will actually enforce, in the
+ * currency's major unit (100 = $100.00): a finite number above 0, or null.
+ * Anything else is dropped with one line, so a typo never silently bars an
+ * account (or silently leaves it uncapped without saying so). Shared by the
+ * constructor and the config reload, like accountSwitchThreshold.
+ * @param {Record<string, any>} acct
+ * @returns {number|null}
+ */
+export function accountMaxDailySpend(acct) {
+  const v = acct?.maxDailySpend;
+  if (v == null) return null;
+  if (typeof v === 'number' && Number.isFinite(v) && v > 0) return v;
+  console.log(`[TeamClaude] Account "${safeLine(acct?.name, 64)}": ignoring maxDailySpend ${safeLine(JSON.stringify(v), 40)} — it must be a number above 0, in the account's currency (100 means $100.00 a day)`);
+  return null;
 }
 
 // Build a fresh in-memory account record from a config/disk account object.
@@ -253,6 +283,10 @@ function makeAccount(acct, index) {
     displayOrder: Number.isFinite(acct.displayOrder) ? acct.displayOrder : null,
     disabled: acct.disabled || false,
     maxUsage: acct.maxUsage ?? null,
+    // Hard cap on money billed per local calendar day (major currency units),
+    // or null. For money-metered seats, which have no quota buckets for
+    // maxUsage to cap. See capExceeded and _trackDailySpend.
+    maxDailySpend: accountMaxDailySpend(acct),
     // Per-account switchThreshold override (issue #409) — a rotation
     // PREFERENCE like the fleet setting, not the hard cap maxUsage is. See
     // thresholdFor() for the resolution order.
@@ -629,6 +663,11 @@ export class AccountManager {
    * alone. Both apply: a Fable request is capped by whichever binds first.
    */
   capExceeded(account, model = null) {
+    // A daily money budget binds every model alike: it is one wallet. It fails
+    // closed: with a cap set and no recent spend reading (probe failing, turned
+    // off, or not run yet) the account is held rather than spending blind.
+    if (this._dailySpendCapReached(account)) return 'dailySpend';
+    if (this._dailySpendUnknown(account)) return 'dailySpendUnknown';
     if (!account?.maxUsage) return null;
     const q = account.quota;
     // Same reason _isNearQuota does this first: a window that has already reset
@@ -2029,7 +2068,10 @@ export class AccountManager {
     // it is a decision rather than an estimate — and unlike the switch threshold
     // nothing overrides it: _selectProbe skips a capped account too, so an
     // account at its cap receives no requests at all.
-    if (this.capExceeded(account, model)) return 'capped';
+    const cap = this.capExceeded(account, model);
+    if (cap === 'dailySpend') return 'spend-capped';
+    if (cap === 'dailySpendUnknown') return 'spend-unknown';
+    if (cap) return 'capped';
 
     // A structured organization-policy 403 means this account cannot serve OAuth
     // requests right now. Skip it across requests until the short cooldown ends.
@@ -3660,6 +3702,99 @@ export class AccountManager {
     return /usage_based$/i.test(String(account?.seatTier || ''));
   }
 
+  /** The local calendar day `now` falls in, as 'YYYY-MM-DD' (process time zone). */
+  static spendDayKey(now = Date.now()) {
+    const d = new Date(now);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+
+  /**
+   * Money this account has billed so far today, in minor units. 0 once the
+   * tracked day is over, so midnight lifts a daily cap without waiting for the
+   * next probe to notice.
+   * @param {any} account
+   * @param {number} [now]
+   * @returns {number}
+   */
+  dailySpendMinor(account, now = Date.now()) {
+    const t = account?.quota?.dailySpend;
+    if (!t || t.day !== AccountManager.spendDayKey(now)) return 0;
+    return t.spentMinor || 0;
+  }
+
+  /**
+   * Whether accounts[].maxDailySpend is set and today's spend has reached it.
+   * @param {any} account
+   * @param {number} [now]
+   * @returns {boolean}
+   */
+  _dailySpendCapReached(account, now = Date.now()) {
+    const cap = account?.maxDailySpend;
+    if (cap == null) return false;
+    const exponent = account.quota?.dailySpend?.exponent ?? account.quota?.spend?.exponent ?? 2;
+    return this.dailySpendMinor(account, now) >= Math.round(cap * 10 ** exponent);
+  }
+
+  /**
+   * Whether a daily cap is set but spend has not been read recently enough to
+   * enforce it (never, or more than SPEND_READING_STALE_MS ago).
+   * @param {any} account
+   * @param {number} [now]
+   * @returns {boolean}
+   */
+  _dailySpendUnknown(account, now = Date.now()) {
+    if (account?.maxDailySpend == null) return false;
+    const seenAt = account.quota?.dailySpend?.seenAt;
+    return typeof seenAt !== 'number' || now - seenAt > SPEND_READING_STALE_MS;
+  }
+
+  /**
+   * Fold one month-to-date spend reading into the per-day tracker.
+   *
+   * The day's spend is the sum of INCREASES between consecutive readings since
+   * local midnight. The very first reading is only a baseline: what was spent
+   * earlier that day, before anything was watching, cannot be told apart from
+   * what was spent earlier in the month, so it is not counted. A reading BELOW
+   * the previous one is a billing-month rollover (everything in it is new
+   * spend) only when the calendar month changed since the last reading or the
+   * figure fell to under half; any other dip is a revision, and re-baselines
+   * with nothing counted rather than charging the whole month to today. An increase straddling midnight counts toward the new day,
+   * the side that keeps a cap conservative.
+   *
+   * Overshoot is bounded by one probe interval: spend is only visible through
+   * the probe, so traffic between two readings is learned at the second.
+   * @param {any} account
+   * @param {number | null | undefined} usedMinor
+   * @param {number} exponent
+   * @param {number} [now]
+   */
+  _trackDailySpend(account, usedMinor, exponent, now = Date.now()) {
+    if (typeof usedMinor !== 'number' || !Number.isFinite(usedMinor)) return;
+    const q = account.quota;
+    const today = AccountManager.spendDayKey(now);
+    const t = q.dailySpend;
+    if (!t || typeof t.lastUsedMinor !== 'number') {
+      q.dailySpend = { day: today, spentMinor: 0, lastUsedMinor: usedMinor, exponent, seenAt: now };
+      return;
+    }
+    const wasCapped = this._dailySpendCapReached(account, now);
+    let delta;
+    if (usedMinor >= t.lastUsedMinor) {
+      delta = usedMinor - t.lastUsedMinor;
+    } else {
+      const prev = typeof t.seenAt === 'number' ? new Date(t.seenAt) : null;
+      const cur = new Date(now);
+      const monthChanged = !prev
+        || prev.getMonth() !== cur.getMonth() || prev.getUTCMonth() !== cur.getUTCMonth();
+      delta = (monthChanged || usedMinor < t.lastUsedMinor / 2) ? usedMinor : 0;
+    }
+    const base = t.day === today ? (t.spentMinor || 0) : 0;
+    q.dailySpend = { day: today, spentMinor: base + delta, lastUsedMinor: usedMinor, exponent, seenAt: now };
+    if (!wasCapped && this._dailySpendCapReached(account, now)) {
+      console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" reached its daily spend cap: ${formatMoney({ usedMinor: q.dailySpend.spentMinor, limitMinor: Math.round(account.maxDailySpend * 10 ** exponent), currency: q.spend?.currency || null, exponent })} today; out of rotation until local midnight`);
+    }
+  }
+
   /**
    * True when an account looks like it carries no plan: every weekly bucket
    * unreported AND no 5h consumption visible.
@@ -4260,6 +4395,7 @@ export class AccountManager {
     if (usage.spend) {
       const was = q.spend;
       q.spend = { ...usage.spend };
+      this._trackDailySpend(account, q.spend.usedMinor, q.spend.exponent ?? 2);
       if (q.spend.enabled && !was?.enabled) {
         console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" can bill real money past its plan limits (extra usage is enabled upstream)`);
       }
@@ -4775,6 +4911,11 @@ export class AccountManager {
         displayOrder: a.displayOrder ?? null,
         disabled: a.disabled || false,
         maxUsage: a.maxUsage ?? null,
+        maxDailySpend: a.maxDailySpend ?? null,
+        // Today's billed money, in minor units of the account's spend currency.
+        dailySpend: a.quota.dailySpend
+          ? { day: AccountManager.spendDayKey(now), spentMinor: this.dailySpendMinor(a, now), exponent: a.quota.dailySpend.exponent ?? 2 }
+          : null,
         // Raw per-account override (issue #409), same shapes as the fleet-wide
         // field, so a remote reader (the attach-mode TUI, a status --json
         // consumer) can resolve it with the shared resolveSwitchThreshold
