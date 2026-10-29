@@ -141,6 +141,7 @@ export const UNAVAILABLE_TEXT = {
   'upstream-rejected': 'upstream reports quota rejected',
   quota: 'local switch threshold reached',
   capped: 'account usage cap reached (maxUsage)',
+  'spend-capped': 'daily spend cap reached (maxDailySpend); back at local midnight',
   'advisor-capped': "advisor model's usage cap reached (maxUsage)",
   entitlement: 'upstream refused this account for the organization (cooldown)',
   route: 'no route allows this account',
@@ -167,20 +168,41 @@ export function spendLine(account, paint) {
   if (!spend.enabled && !spent) return null;
 
   const amount = formatMoney(spend);
+  const today = dailySpendText(account);
   if (spend.enabled) {
     // Already billing is the louder of the two: red, and named as money rather
     // than as a percentage, so it cannot be mistaken for another quota bar.
     const text = spent
       ? `billing real money — ${amount} used this month`
       : `can bill real money past its plan limits — ${amount} used`;
-    return `${paint.dim('Spend'.padEnd(8))} ${(spent ? paint.red : paint.yellow)(`\u26a0 ${text}`)}`;
+    return `${paint.dim('Spend'.padEnd(8))} ${(spent ? paint.red : paint.yellow)(`\u26a0 ${text}`)}${today}`;
   }
   // Not enabled, but money was spent this month. Say why it is off now, since
   // "out_of_credits" and "the member turned it off" have different futures.
   const why = spend.userDisabled ? 'now disabled by the account holder'
     : spend.disabledReason ? `now off (${safeLine(spend.disabledReason, 64)})`
     : 'now off';
-  return `${paint.dim('Spend'.padEnd(8))} ${paint.yellow(`${amount} spent this month, ${why}`)}`;
+  return `${paint.dim('Spend'.padEnd(8))} ${paint.yellow(`${amount} spent this month, ${why}`)}${today}`;
+}
+
+/**
+ * ' · today $X of $Y cap' (or ' · today $X' when uncapped), or '' when the
+ * account has no daily tracker yet. Money, never a bar: a daily cap meters a
+ * wallet, not a plan allowance.
+ */
+function dailySpendText(account) {
+  const d = account?.dailySpend;
+  if (!d) return '';
+  const exponent = d.exponent ?? 2;
+  const currency = account?.quota?.spend?.currency || null;
+  const cap = account?.maxDailySpend;
+  const money = formatMoney({
+    usedMinor: d.spentMinor || 0,
+    limitMinor: cap != null ? Math.round(cap * 10 ** exponent) : null,
+    currency,
+    exponent,
+  });
+  return ` \u00b7 today ${money}${cap != null ? ' cap' : ''}`;
 }
 
 /**
