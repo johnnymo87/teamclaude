@@ -11,7 +11,7 @@ import { decideBand, pressureOf, pressureRank, assertNever } from './band-decisi
 import { BurnRateLearner, ConcurrencyLearner, scoreCandidate } from './adaptive-distribution.js';
 import { safeLine } from './safe-text.js';
 /** @typedef {import('./session-tracker.js').Observation} Observation */
-import { VALID_ROUTING_STRATEGIES, normalizeFinalWindowHours } from './config.js';
+import { VALID_ROUTING_STRATEGIES, normalizeFinalWindowHours, normalizeUsageSeatFirst } from './config.js';
 
 // Re-exported for callers that import these model helpers from here.
 export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
@@ -391,8 +391,9 @@ export class AccountManager {
    * @param {string} [opts.routingStrategy]
    * @param {number} [opts.weeklyBalanceMargin]
    * @param {number} [opts.finalWindowHours]
+   * @param {boolean} [opts.usageSeatFirst]
    */
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, routingStrategy = 'expiry', weeklyBalanceMargin = 0.10, finalWindowHours = 0 } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, routingStrategy = 'expiry', weeklyBalanceMargin = 0.10, finalWindowHours = 0, usageSeatFirst = false } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -455,6 +456,12 @@ export class AccountManager {
       console.warn(`[TeamClaude] finalWindowHours ${finalWindowHours} is invalid (want 0..24); final-window preference is off`);
     }
 
+    // Usage-based seat preference (bead [NO-JIRA]). Under balanced routing,
+    // spend a Claude Enterprise usage-based seat first every day up to its
+    // daily spend cap (accounts[].maxDailySpend), except while a subscription
+    // account is in its final weekly window.
+    this.usageSeatFirst = normalizeUsageSeatFirst(usageSeatFirst);
+
     // Counters for margin-driven preemption outcomes (design D8, bead yri.8).
     //
     // Why this exists:
@@ -472,6 +479,7 @@ export class AccountManager {
     // - self_best: current account already ranks best or no candidate was available.
     // - pin_released: session-driven margin preemption released a session pin in _selectForSession.
     // - final_window: cursor rotated to a candidate in its final weekly window (bypassing margin).
+    // - seat_first: cursor rotated to a usage-based seat (bypassing margin).
     // - held_imputed: current account W was imputed (median/empty) after reset; held cursor to avoid bounce.
     this.marginMove = {
       done: 0,
@@ -481,6 +489,7 @@ export class AccountManager {
       self_best: 0,
       pin_released: 0,
       final_window: 0,
+      seat_first: 0,
       held_imputed: 0,
     };
 
@@ -2168,6 +2177,9 @@ export class AccountManager {
    * the weekly reset thanks to FIX 2), and they are not cycles because each is
    * driven by a monotone signal (time, 5h rising) or by availability.
    *
+   * Seat moves strictly improve the (finalKey, seatKey) lexicographic key, so
+   * they can't cycle.
+   *
    * Preconditions for the proof to hold (design D4 [R1]):
    * 1. weeklyBalanceMargin >= 0.02 > 0 strictly (clamps prevent 0, which would
    *    admit A->B->A flapping).
@@ -2202,7 +2214,10 @@ export class AccountManager {
     }
 
     const finalMove = this._inFinalWindow(best, { current, now });
-    if (!finalMove) {
+    const seatMove = Boolean(this.usageSeatFirst
+      && AccountManager.isUsageBasedSeat(best)
+      && !AccountManager.isUsageBasedSeat(current));
+    if (!finalMove && !seatMove) {
       const wCurrent = curW?.value ?? 0;
       const wBest = W[best.index]?.value ?? 0;
       if (wCurrent - wBest < this.weeklyBalanceMargin - MARGIN_FLOAT_EPSILON) {
@@ -2225,6 +2240,7 @@ export class AccountManager {
 
     if (count) {
       if (finalMove) this.marginMove.final_window++;
+      else if (seatMove) this.marginMove.seat_first++;
       else this.marginMove.done++;
     }
     return best;
@@ -3878,16 +3894,18 @@ export class AccountManager {
    *   2. under balanced routing with finalWindowHours > 0, an account whose
    *      governing weekly window resets within that window (and 5h < 0.90)
    *      sorts first; among final-window accounts, the sooner reset wins
-   *   3. then the account with no known weekly limit — using it lets us
+   *   3. under balanced routing with usageSeatFirst, an available usage-based
+   *      seat sorts next
+   *   4. then the account with no known weekly limit — using it lets us
    *      discover its quota
-   *   4. then the account with the most expiring quota (headroom per second
+   *   5. then the account with the most expiring quota (headroom per second
    *      until its window resets), when expiry routing is on
-   *   5. then the account whose weekly limit expires soonest: that quota is
+   *   6. then the account whose weekly limit expires soonest: that quota is
    *      closest to refreshing, so spending it first preserves accounts whose
    *      weekly window resets further out.
-   * With expiry routing off, step 4 is absent for every account and this reduces
+   * With expiry routing off, step 5 is absent for every account and this reduces
    * to the weekly-reset heuristic. Returns the account or null if none are
-   * available. Step 4 generalises step 5: at equal headroom soonest reset is
+   * available. Step 5 generalises step 6: at equal headroom soonest reset is
    * highest pressure, and the two part only where a timestamp alone would rank a
    * nearly-drained account resetting in an hour over one holding 20x the quota
    * that expires in ten.
@@ -3901,6 +3919,7 @@ export class AccountManager {
     let best = null;
     let bestPriority = Infinity;
     let bestFinal = Infinity;
+    let bestSeat = Infinity;
     let bestSharedReset = Infinity;
     let bestPressure = Infinity;
     let bestReset = Infinity;
@@ -3912,6 +3931,7 @@ export class AccountManager {
     candidates.forEach((account, i) => {
       const priority = account.priority || 0;
       const finalKey = this._inFinalWindow(account, { current, now }) ? 0 : 1;
+      const seatKey = (this.usageSeatFirst && this.routingStrategy === 'balanced' && AccountManager.isUsageBasedSeat(account)) ? 0 : 1;
       const sharedReset = this._governingWindow(account, null).resetAt ?? Infinity;
       const pressure = pressures[i];
       // Rank by the reset of the weekly window that governs THIS model (Fable and
@@ -3923,11 +3943,13 @@ export class AccountManager {
       const better = priority !== bestPriority ? priority < bestPriority
         : finalKey !== bestFinal ? finalKey < bestFinal
         : finalKey === 0 && sharedReset !== bestSharedReset ? sharedReset < bestSharedReset
+        : seatKey !== bestSeat ? seatKey < bestSeat
         : pressure !== bestPressure ? pressure < bestPressure
         : weeklyReset < bestReset;
       if (better) {
         bestPriority = priority;
         bestFinal = finalKey;
+        bestSeat = seatKey;
         bestSharedReset = sharedReset;
         bestPressure = pressure;
         bestReset = weeklyReset;
@@ -4891,6 +4913,7 @@ export class AccountManager {
       routingStrategy: this.routingStrategy,
       weeklyBalanceMargin: this.weeklyBalanceMargin,
       finalWindowHours: this.finalWindowHours,
+      usageSeatFirst: this.usageSeatFirst,
       // The knob as the server resolved it, defaults and clamps applied, so an
       // operator reading status sees the configuration the router is using.
       expiryRouting: { ...this.expiryRouting },

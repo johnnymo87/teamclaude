@@ -134,6 +134,20 @@ export function normalizeFinalWindowHours(value) {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 24 ? value : 0;
 }
 
+/**
+ * Normalizes a usageSeatFirst setting.
+ *
+ * When true, a Claude Enterprise usage-based seat is spent first every day
+ * up to its daily cap under balanced routing. Anything other than boolean true
+ * resolves to false (off).
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+export function normalizeUsageSeatFirst(value) {
+  return value === true;
+}
+
 export function createDefaultConfig() {
   return {
     proxy: {

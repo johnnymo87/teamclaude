@@ -245,6 +245,14 @@ Configuring `finalWindowHours` (e.g. `5`, bounded to `0`..`24`, default `0` = of
 - **Margin bypass (`_marginPreemptedBy`):** When the ranking winner is in its final window, the cursor moves without requiring the `weeklyBalanceMargin` differential. The 5h (`MARGIN_5H_GUARD = 0.90`) and pause guards still apply. Counted in `marginMove.final_window`.
 - **Session distribution (`_belowBandFloor`):** Under session distribution modes (`distributeSessions`), final-window accounts receive held-off score `-1`, sorting before load terms so they are spent first and never held off.
 
+### Usage-based seat preference (`usageSeatFirst`)
+
+A Claude Enterprise usage-based seat (`seatTier: enterprise_usage_based`) reports no quota buckets and is metered in money up to its daily spend cap (`accounts[].maxDailySpend`). Under balanced routing with `usageSeatFirst: true` (default `false`), available usage seats are spent first every day up to their daily spend cap:
+
+- **Precedence:** If a subscription account is in its final weekly window (`finalWindowHours`), that final-window account still comes first. Once no account is in its final window, an available usage seat is preferred over subscription accounts. After the seat reaches its daily cap, normal balanced routing resumes among the remaining accounts.
+- **Margin bypass (`_marginPreemptedBy`):** When rotating onto a usage seat from a non-seat account, the cursor moves without requiring the `weeklyBalanceMargin` differential. Counted in `marginMove.seat_first`.
+- **Strategy bound:** Like final-window preference, `usageSeatFirst` only takes effect when `routingStrategy` is `"balanced"`.
+
 ### Observability on `/status`
 
 Under balanced routing, `teamclaude status --json` (and `GET /teamclaude/status`) exposes:
@@ -252,12 +260,14 @@ Under balanced routing, `teamclaude status --json` (and `GET /teamclaude/status`
 - **`routingStrategy`** — the active strategy (`"balanced"`, `"expiry"`, or `"drain"`).
 - **`weeklyBalanceMargin`** — the effective clamped balance margin.
 - **`finalWindowHours`** — the configured final-window threshold (`0` = off).
+- **`usageSeatFirst`** — configured usage-based seat preference (`false` = off).
 - **`accounts[].W`** — each account's model-independent weekly balance metric `{ value, provenance }` (`provenance`: `'unified'`, `'family-proxy'`, `'median'`, or `'empty'`).
 - **`accounts[].finalWindow`** — boolean indicating whether the account is currently available and in its final weekly window.
 - **`spread`** — per-provider `max(W) - min(W)` utilization spread, designed for alerting (e.g. spread >= margin sustained for > 2 hours with zero moves).
 - **`marginMove`** — counters tracking the outcomes of margin preemption evaluations:
   - `done`: margin preemption successfully rotated the cursor to a lower-W candidate.
   - `final_window`: cursor rotated onto an account in its final weekly window, bypassing the balance margin.
+  - `seat_first`: cursor rotated onto a usage-based seat, bypassing the balance margin.
   - `blocked_5h`: candidate had >= margin advantage (or final window) but was blocked because `unified5h >= 0.90`.
   - `blocked_paused`: candidate had >= margin advantage (or final window) but is paused.
   - `below_margin`: best candidate's W was not lower than current W by at least `weeklyBalanceMargin`.
