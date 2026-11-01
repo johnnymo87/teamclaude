@@ -1,7 +1,7 @@
-import { test } from 'node:test';
+import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { normalizeUsageSeatFirst } from '../src/config.js';
-import { AccountManager } from '../src/account-manager.js';
+import { AccountManager, SEAT_THROTTLE_HOLD_MS } from '../src/account-manager.js';
 
 function oauth(name, extra = {}) {
   return { name, type: 'oauth', accessToken: 't-' + name, refreshToken: 'r', expiresAt: Date.now() + 3600_000, ...extra };
@@ -277,3 +277,140 @@ test('non-balanced strategies: usageSeatFirst has no effect under expiry and dra
     );
   }
 });
+
+test('uncapped seat: usageSeatFirst flag on has no effect without maxDailySpend (old behavior)', () => {
+  const am = new AccountManager([
+    oauth('sub', { priority: 0 }),
+    oauth('seatUncapped', { ...ENTERPRISE, priority: 0 }), // maxDailySpend is undefined / null
+    oauth('sub2', { priority: 0 }),
+  ], 0.98, {
+    routingStrategy: 'balanced',
+    weeklyBalanceMargin: 0.10,
+    usageSeatFirst: true,
+  });
+  bucket(am, 0, 'unified7d', 0.20, 50);
+  bucket(am, 2, 'unified7d', 0.40, 50);
+
+  // Uncapped seat: sub (0.20) beats seatUncapped (median 0.30)
+  assert.equal(am._pickBestAvailable(null, OPUS).name, 'sub');
+  assert.equal(am._select(null, OPUS).name, 'sub');
+  assert.equal(am.currentIndex, 0);
+  assert.equal(am.marginMove.seat_first, 0);
+});
+
+test('snap-back hold: throttled seat yields cursor, throttle expiry stays on Max during hold, hold expiry returns to seat', () => {
+  const start = Date.now();
+  mock.timers.enable({ apis: ['Date'], now: start });
+  try {
+    const am = new AccountManager([
+      oauth('seat', { ...ENTERPRISE, priority: 0, maxDailySpend: 100 }),
+      oauth('max', { priority: 0 }),
+    ], 0.98, {
+      routingStrategy: 'balanced',
+      weeklyBalanceMargin: 0.10,
+      usageSeatFirst: true,
+    });
+    am.applyUsageData(0, spend(0));
+    bucket(am, 1, 'unified7d', 0.20, 50);
+
+    // Initially seat is chosen
+    assert.equal(am._select(null, OPUS).name, 'seat');
+    assert.equal(am.currentIndex, 0);
+
+    // Throttle seat for 10 seconds
+    am.markRateLimited(0, 10);
+    assert.equal(am.accounts[0].status, 'throttled');
+    assert.equal(typeof am.accounts[0].seatHoldUntil, 'number');
+    assert.equal(am.accounts[0].seatHoldUntil, start + SEAT_THROTTLE_HOLD_MS);
+
+    // Cursor moves to max
+    const afterThrottle = am._select(null, OPUS);
+    assert.equal(afterThrottle.name, 'max');
+    assert.equal(am.currentIndex, 1);
+
+    // Advance 20 seconds: throttle expired (10s), but within 15-min hold
+    mock.timers.setTime(start + 20_000);
+    assert.equal(am._isAvailable(am.accounts[0]), true); // seat is available again
+    // But stays on max within the hold!
+    const withinHold = am._select(null, OPUS);
+    assert.equal(withinHold.name, 'max');
+    assert.equal(am.currentIndex, 1);
+
+    // Advance past hold (16 minutes)
+    mock.timers.setTime(start + 16 * 60 * 1000);
+    const afterHold = am._select(null, OPUS);
+    assert.equal(afterHold.name, 'seat');
+    assert.equal(am.currentIndex, 0);
+    assert.equal(am.marginMove.seat_first, 1);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test('_divertedFor: drops stored diversion so diverted family lands on seat', () => {
+  const FABLE = 'claude-fable-5';
+  const am = new AccountManager([
+    oauth('max1', { priority: 0 }),
+    oauth('seat', { ...ENTERPRISE, priority: 0, maxDailySpend: 100 }),
+    oauth('max2', { priority: 0 }),
+  ], 0.98, {
+    routingStrategy: 'balanced',
+    weeklyBalanceMargin: 0.10,
+    usageSeatFirst: true,
+  });
+  am.applyUsageData(1, spend(0));
+  bucket(am, 0, 'unified7d', 0.20, 50);
+  // max1 Fable bucket is spent
+  bucket(am, 0, 'unified7dFable', 0.99, 50);
+  bucket(am, 2, 'unified7d', 0.30, 50);
+  bucket(am, 2, 'unified7dFable', 0.20, 50);
+
+  // Pre-seed routeCursors for Fable to max2 (simulating prior diversion)
+  const fableKey = am._cursorKey(FABLE);
+  am.routeCursors.set(fableKey, 2);
+
+  // max1 cannot serve Fable; _divertedFor should drop the stored diversion to max2
+  // and land on seat
+  const picked = am.getActiveAccount(null, FABLE);
+  assert.equal(picked.name, 'seat');
+  assert.equal(am.routeCursors.get(fableKey), 1);
+});
+
+test('getStatus: reports usageSeat: true|false on each account in accounts list', () => {
+  const am = new AccountManager([
+    oauth('max', { priority: 0 }),
+    oauth('seat', { ...ENTERPRISE, priority: 0, maxDailySpend: 100 }),
+  ]);
+  const status = am.getStatus();
+  assert.equal(status.accounts[0].usageSeat, false);
+  assert.equal(status.accounts[1].usageSeat, true);
+});
+
+test('probe-learned quotas: probing true initially, applyUsageData re-evaluates and seat becomes active', () => {
+  const am = new AccountManager([
+    oauth('max', { priority: 0 }),
+    oauth('seat', { ...ENTERPRISE, priority: 0, maxDailySpend: 100 }),
+  ], 0.98, {
+    routingStrategy: 'balanced',
+    weeklyBalanceMargin: 0.10,
+    usageSeatFirst: true,
+  });
+  // Initially probing
+  am.accounts[0].probing = true;
+  assert.equal(am.currentIndex, 0);
+
+  // Prober learns seat spend and max weekly quota
+  am.applyUsageData(1, spend(0));
+  am.applyUsageData(0, { sevenDay: { utilization: 0.20, resetAt: Date.now() + 50 * H } });
+  assert.equal(am.accounts[0].probing, false);
+  assert.equal(am.accounts[0].requalify, true);
+
+  // getActiveAccount re-evaluates via requalify -> _selectNext; seat becomes active
+  const active = am.getActiveAccount(null, OPUS);
+  assert.equal(active.name, 'seat');
+  assert.equal(am.currentIndex, 1);
+  // Note: in the requalify -> _selectNext path, marginMove.final_window is not incremented
+  // (marginMove counters are only modified inside _marginPreemptedBy), so seat_first is likewise not incremented.
+  assert.equal(am.marginMove.seat_first, 0);
+});
+

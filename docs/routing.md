@@ -247,10 +247,13 @@ Configuring `finalWindowHours` (e.g. `5`, bounded to `0`..`24`, default `0` = of
 
 ### Usage-based seat preference (`usageSeatFirst`)
 
-A Claude Enterprise usage-based seat (`seatTier: enterprise_usage_based`) reports no quota buckets and is metered in money up to its daily spend cap (`accounts[].maxDailySpend`). Under balanced routing with `usageSeatFirst: true` (default `false`), available usage seats are spent first every day up to their daily spend cap:
+A Claude Enterprise usage-based seat (`seatTier: enterprise_usage_based`) reports no quota buckets and is metered in money up to its daily spend cap (`accounts[].maxDailySpend`). Under balanced routing with `usageSeatFirst: true` (default `false`), available capped usage seats are spent first every day up to their daily spend cap:
 
-- **Precedence:** If a subscription account is in its final weekly window (`finalWindowHours`), that final-window account still comes first. Once no account is in its final window, an available usage seat is preferred over subscription accounts. After the seat reaches its daily cap, normal balanced routing resumes among the remaining accounts.
+- **Requires cap:** Seat-first preference only applies to seats with `accounts[].maxDailySpend` configured; an uncapped seat follows standard balanced ranking.
+- **Precedence:** If a subscription account is in its final weekly window (`finalWindowHours`), that final-window account still comes first. Once no account is in its final window, an available capped usage seat is preferred over subscription accounts. After the seat reaches its daily cap, normal balanced routing resumes among the remaining accounts.
+- **Snap-back hold:** If the seat is throttled (429) or paused, seat-first preference is suspended for 15 minutes (`SEAT_THROTTLE_HOLD_MS = 15m`) to prevent snap-back thrashing after rate limits. The seat can still be selected via ordinary balanced ranking during the hold.
 - **Margin bypass (`_marginPreemptedBy`):** When rotating onto a usage seat from a non-seat account, the cursor moves without requiring the `weeklyBalanceMargin` differential. Counted in `marginMove.seat_first`.
+- **Diversion override (`_divertedFor`):** When a model family is diverted away from a subscription account, an available seat-first seat drops the stored diversion so that family requests land on the seat.
 - **Strategy bound:** Like final-window preference, `usageSeatFirst` only takes effect when `routingStrategy` is `"balanced"`.
 
 ### Observability on `/status`
@@ -263,6 +266,7 @@ Under balanced routing, `teamclaude status --json` (and `GET /teamclaude/status`
 - **`usageSeatFirst`** — configured usage-based seat preference (`false` = off).
 - **`accounts[].W`** — each account's model-independent weekly balance metric `{ value, provenance }` (`provenance`: `'unified'`, `'family-proxy'`, `'median'`, or `'empty'`).
 - **`accounts[].finalWindow`** — boolean indicating whether the account is currently available and in its final weekly window.
+- **`accounts[].usageSeat`** — boolean indicating whether the account is an enterprise usage-based seat.
 - **`spread`** — per-provider `max(W) - min(W)` utilization spread, designed for alerting (e.g. spread >= margin sustained for > 2 hours with zero moves).
 - **`marginMove`** — counters tracking the outcomes of margin preemption evaluations:
   - `done`: margin preemption successfully rotated the cursor to a lower-W candidate.

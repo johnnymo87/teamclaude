@@ -109,6 +109,9 @@ export const RESET_HOLD_MS = 15 * 60_000;
 // four default probe cycles): a cap that cannot see spend must not keep
 // spending. See AccountManager.capExceeded.
 export const SPEND_READING_STALE_MS = 20 * 60_000;
+// A usage-based seat that was throttled or paused gets no seat-first preference
+// for this long, preventing snap-back thrashing after a 429.
+export const SEAT_THROTTLE_HOLD_MS = 15 * 60_000;
 
 // Quota fields that survive a restart: utilization levels and their reset
 // windows, learned passively from upstream responses. Transient/derived state
@@ -345,6 +348,9 @@ function makeAccount(acct, index) {
     // retry-after. Distinct from `throttled`/rateLimitedUntil: it does NOT
     // make the account unavailable, so selection never rotates away from it.
     pausedUntil: null,
+    // Snap-back hold timestamp for a usage-based seat after throttle/pause.
+    /** @type {number | null} */
+    seatHoldUntil: null,
     // When this account's token was last successfully refreshed. Gates forced
     // (post-401) refreshes so a burst of stale in-flight requests can't rotate
     // the refresh-token family once per request — see ensureTokenFresh.
@@ -854,6 +860,9 @@ export class AccountManager {
     // the pause branch; once it lifts, _rampCap counts from here and releases the
     // backlog gradually (startConc, then +stepConc per step).
     if (this.ramp.enabled) account.rampStartedAt = account.pausedUntil;
+    if (AccountManager.isUsageBasedSeat(account)) {
+      account.seatHoldUntil = Date.now() + SEAT_THROTTLE_HOLD_MS;
+    }
   }
 
   /** Keep an OAuth-policy-denied account out of automatic rotation temporarily.
@@ -2214,9 +2223,8 @@ export class AccountManager {
     }
 
     const finalMove = this._inFinalWindow(best, { current, now });
-    const seatMove = Boolean(this.usageSeatFirst
-      && AccountManager.isUsageBasedSeat(best)
-      && !AccountManager.isUsageBasedSeat(current));
+    const seatMove = Boolean(this._isSeatFirst(best, now)
+      && !this._isSeatFirst(current, now));
     if (!finalMove && !seatMove) {
       const wCurrent = curW?.value ?? 0;
       const wBest = W[best.index]?.value ?? 0;
@@ -2470,7 +2478,15 @@ export class AccountManager {
    */
   _divertedFor(model, advisorModel = null, exclude = null) {
     if (!model) return null;
-    const idx = this.routeCursors.get(this._cursorKey(model, advisorModel));
+    const key = this._cursorKey(model, advisorModel);
+    if (this.usageSeatFirst) {
+      const best = this._pickBestAvailable(exclude, model, advisorModel, this.accounts[this.currentIndex]);
+      if (best && this._isSeatFirst(best)) {
+        this.routeCursors.delete(key);
+        return null;
+      }
+    }
+    const idx = this.routeCursors.get(key);
     const account = idx != null ? this.accounts[idx] : null;
     if (!account || account.index === this.currentIndex || exclude?.has(account.index)) return null;
     if (!this._isAvailable(account, model, advisorModel)) return null;
@@ -2607,6 +2623,23 @@ export class AccountManager {
     }
 
     return true;
+  }
+
+  /**
+   * Whether the account qualifies for seat-first priority: balanced strategy,
+   * usageSeatFirst enabled, usage-based seat, has a daily spend cap, and is not
+   * held under a throttle/pause snap-back hold.
+   *
+   * @param {any} account
+   * @param {number} [now]
+   * @returns {boolean}
+   */
+  _isSeatFirst(account, now = Date.now()) {
+    return Boolean(this.usageSeatFirst
+      && this.routingStrategy === 'balanced'
+      && AccountManager.isUsageBasedSeat(account)
+      && account?.maxDailySpend != null
+      && (!account?.seatHoldUntil || now >= account.seatHoldUntil));
   }
 
   /**
@@ -3931,7 +3964,7 @@ export class AccountManager {
     candidates.forEach((account, i) => {
       const priority = account.priority || 0;
       const finalKey = this._inFinalWindow(account, { current, now }) ? 0 : 1;
-      const seatKey = (this.usageSeatFirst && this.routingStrategy === 'balanced' && AccountManager.isUsageBasedSeat(account)) ? 0 : 1;
+      const seatKey = this._isSeatFirst(account, now) ? 0 : 1;
       const sharedReset = this._governingWindow(account, null).resetAt ?? Infinity;
       const pressure = pressures[i];
       // Rank by the reset of the weekly window that governs THIS model (Fable and
@@ -4520,6 +4553,9 @@ export class AccountManager {
     // after throttleProbeFloorMs from here, so a probe that 429s again pushes
     // the next probe out by a full floor rather than hammering upstream.
     account.throttledAt = Date.now();
+    if (AccountManager.isUsageBasedSeat(account)) {
+      account.seatHoldUntil = Date.now() + SEAT_THROTTLE_HOLD_MS;
+    }
     console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" rate limited for ${retryAfterSeconds}s`);
   }
 
@@ -4933,6 +4969,7 @@ export class AccountManager {
         // draws array order beside a server TUI drawing the arrangement.
         displayOrder: a.displayOrder ?? null,
         disabled: a.disabled || false,
+        usageSeat: AccountManager.isUsageBasedSeat(a),
         maxUsage: a.maxUsage ?? null,
         maxDailySpend: a.maxDailySpend ?? null,
         // Today's billed money, in minor units of the account's spend currency.
