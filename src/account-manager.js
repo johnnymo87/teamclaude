@@ -4324,7 +4324,8 @@ export class AccountManager {
     // Opt-in per-response ledger (TEAMCLAUDE_USAGE_LOG; src/cache-ttl.js).
     if (process.env.TEAMCLAUDE_USAGE_LOG) {
       const acct = this.accounts[accountIndex];
-      appendUsageLog({ account: acct?.name, bucket: this._weeklyBucketFor(model), model, sessionKey, usage, util7d: acct?.quota?.unified7d });
+      const bucket = this._weeklyBucketFor(model);
+      appendUsageLog({ account: acct?.name, bucket, model, sessionKey, usage, util7d: acct?.quota?.unified7d, bucketUtil: acct?.quota?.[bucket] });
     }
     // The same resolver routing uses, so a token total and a routing decision
     // agree about which family a request belonged to. Resolved here rather than

@@ -61,28 +61,45 @@ export function ttlForRequest(headers, rule = loadTtlRule()) {
   return null;
 }
 
-// Set `ttl` on every `cache_control` of type ephemeral that has none. Returns
-// the same Buffer when nothing changed (or the body is not JSON), so callers
-// can detect a rewrite by identity. An explicit ttl the client chose is kept.
+// Set `ttl` on every `cache_control` of type ephemeral that has none, at the
+// documented positions only (top level, system[], tools[], messages[].content[]
+// and the nested content of a tool_result) -- never inside tool_use.input or
+// metadata, which are the model's/client's own data. Returns the same Buffer
+// when nothing changed (or the body is not JSON), so callers detect a rewrite
+// by identity. Skips the whole body if the client already set an explicit
+// "5m" anywhere: Anthropic requires 1h entries to precede 5m ones, and
+// upgrading a later unset breakpoint past an explicit 5m one would 400.
 export function applyCacheTtl(body, ttl) {
   if (!ttl || !body || body.length === 0) return body;
   let json;
   try { json = JSON.parse(body.toString('utf8')); } catch { return body; }
-  let changed = 0;
-  const walk = (node) => {
-    if (Array.isArray(node)) { for (const x of node) walk(x); return; }
-    if (!node || typeof node !== 'object') return;
-    for (const [k, v] of Object.entries(node)) {
-      if (k === 'cache_control' && v && typeof v === 'object' && !Array.isArray(v)) {
-        if (v.type === 'ephemeral' && v.ttl === undefined) { v.ttl = ttl; changed++; }
-      } else walk(v);
-    }
+  if (!json || typeof json !== 'object' || Array.isArray(json)) return body;
+  const targets = [];
+  const take = (node) => {
+    const cc = node && typeof node === 'object' ? node.cache_control : undefined;
+    if (cc && typeof cc === 'object' && !Array.isArray(cc) && cc.type === 'ephemeral') targets.push(cc);
   };
-  walk(json);
+  take(json);
+  for (const k of ['system', 'tools']) if (Array.isArray(json[k])) json[k].forEach(take);
+  if (Array.isArray(json.messages)) {
+    for (const m of json.messages) {
+      if (!m || !Array.isArray(m.content)) continue;
+      for (const block of m.content) {
+        take(block);
+        if (block && block.type === 'tool_result' && Array.isArray(block.content)) block.content.forEach(take);
+      }
+    }
+  }
+  if (targets.some(cc => cc.ttl === '5m')) return body;
+  let changed = 0;
+  for (const cc of targets) if (cc.ttl === undefined) { cc.ttl = ttl; changed++; }
   return changed ? Buffer.from(JSON.stringify(json), 'utf8') : body;
 }
 
-export function usageLogLine({ account, bucket, model, sessionKey, usage, util7d, now = Date.now() }) {
+// `sessionKey` may carry `util7d`/`util5h` snapshotted from THIS response's
+// rate-limit headers; when absent, `util7d` (the account's last-seen value,
+// possibly moved by a concurrent response) is logged with source "cached".
+export function usageLogLine({ account, bucket, model, sessionKey, usage, util7d, bucketUtil, now = Date.now() }) {
   const n = (x) => (Number.isFinite(x) ? x : 0);
   const cc = usage?.cache_creation || {};
   return JSON.stringify({
@@ -98,7 +115,10 @@ export function usageLogLine({ account, bucket, model, sessionKey, usage, util7d
     cache_write_5m: n(cc.ephemeral_5m_input_tokens),
     cache_write_1h: n(cc.ephemeral_1h_input_tokens),
     output: n(usage?.output_tokens),
-    util7d: Number.isFinite(util7d) ? util7d : null,
+    util7d: Number.isFinite(sessionKey?.util7d) ? sessionKey.util7d : (Number.isFinite(util7d) ? util7d : null),
+    util7d_source: Number.isFinite(sessionKey?.util7d) ? 'response' : (Number.isFinite(util7d) ? 'cached' : null),
+    util5h: Number.isFinite(sessionKey?.util5h) ? sessionKey.util5h : null,
+    bucket_util: Number.isFinite(bucketUtil) ? bucketUtil : null,
   });
 }
 

@@ -2512,7 +2512,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // Content-Length is refreshed below because the body can shrink.
   let sendBody = rewriteRequestBody(body, account, req.url, req.headers['content-type']);
   // Opt-in per-session cache TTL upgrade (src/cache-ttl.js); Anthropic bodies only.
-  if (rewritesBody(account)) {
+  // Skipped for an account configured to strip cache_control.ttl (a strict
+  // upstream that rejects it), which the upgrade would otherwise write back.
+  if (rewritesBody(account) && !cacheControlSubfieldsToStrip(account.stripRequestFields).has('ttl')) {
     const ttl = ttlForRequest(req.headers);
     if (ttl) sendBody = applyCacheTtl(sendBody, ttl);
   }
@@ -2601,6 +2603,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       }
     }
     accountManager.updateQuota(account.index, rateLimitHeaders);
+    // Snapshot this response's own utilization for the usage ledger.
+    if (ctx.sessionHeaders) {
+      const u7 = parseFloat(rateLimitHeaders['anthropic-ratelimit-unified-7d-utilization']);
+      const u5 = parseFloat(rateLimitHeaders['anthropic-ratelimit-unified-5h-utilization']);
+      ctx.sessionHeaders = { ...ctx.sessionHeaders, util7d: Number.isFinite(u7) ? u7 : undefined, util5h: Number.isFinite(u5) ? u5 : undefined };
+    }
 
     // Any non-429 response is live proof a rate-limit hold no longer binds —
     // this is what lets a revalidation probe (a throttled account selected by
