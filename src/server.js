@@ -6,6 +6,7 @@ import { readdir, stat, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ensureCerts, createConnectHandler, mitmHosts } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
+import { ttlForRequest, applyCacheTtl, sessionHeaders } from './cache-ttl.js';
 import { sanitizeToolPairs } from './tool-pair-sanitize.js';
 import { sanitizeCacheControl, cacheControlSubfieldsToStrip } from './cache-control-sanitize.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
@@ -2510,6 +2511,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // Every rewrite below runs inside rewriteRequestBody (exported for tests);
   // Content-Length is refreshed below because the body can shrink.
   let sendBody = rewriteRequestBody(body, account, req.url, req.headers['content-type']);
+  // Opt-in per-session cache TTL upgrade (src/cache-ttl.js); Anthropic bodies only.
+  // Skipped for an account configured to strip cache_control.ttl (a strict
+  // upstream that rejects it), which the upgrade would otherwise write back.
+  if (rewritesBody(account) && !cacheControlSubfieldsToStrip(account.stripRequestFields).has('ttl')) {
+    const ttl = ttlForRequest(req.headers);
+    if (ttl) sendBody = applyCacheTtl(sendBody, ttl);
+  }
+  ctx.sessionHeaders = sessionHeaders(req.headers);
   // If the body changed length (sanitize, model rewrite, or field strip), update
   // Content-Length so the upstream doesn't receive a mismatched framing and
   // truncate or stall.
@@ -2594,6 +2603,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       }
     }
     accountManager.updateQuota(account.index, rateLimitHeaders);
+    // Snapshot this response's own utilization for the usage ledger.
+    if (ctx.sessionHeaders) {
+      const u7 = parseFloat(rateLimitHeaders['anthropic-ratelimit-unified-7d-utilization']);
+      const u5 = parseFloat(rateLimitHeaders['anthropic-ratelimit-unified-5h-utilization']);
+      ctx.sessionHeaders = { ...ctx.sessionHeaders, util7d: Number.isFinite(u7) ? u7 : undefined, util5h: Number.isFinite(u5) ? u5 : undefined };
+    }
 
     // Any non-429 response is live proof a rate-limit hold no longer binds —
     // this is what lets a revalidation probe (a throttled account selected by
@@ -3016,7 +3031,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
       try {
-        await streamResponse(upstreamRes.body, res, account.index, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model);
+        await streamResponse(upstreamRes.body, res, account.index, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model, ctx.sessionHeaders);
         // Reached only when the stream completed. A stream that dies upstream
         // throws out of streamResponse, so it never marks itself delivered —
         // which is the failure the token counters cannot see, since a stream
@@ -3031,7 +3046,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       l?.end();
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
-      extractUsageFromBody(buf, account.index, accountManager, ctx.onUsage, ctx.pinKey, ctx.model);
+      extractUsageFromBody(buf, account.index, accountManager, ctx.onUsage, ctx.pinKey, ctx.model, ctx.sessionHeaders);
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
       res.end(buf);
@@ -3193,7 +3208,7 @@ export function readWithIdleTimeout(reader, ms) {
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
-export async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null, pinKey = null, model = null) {
+export async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null, pinKey = null, model = null, sessionKey = null) {
   const reader = webStream.getReader();
   // A client that leaves while upstream is silent must not hold the pending
   // read — and with it the upstream socket and its admission permit — until
@@ -3274,7 +3289,7 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
     // all (a ping and some text deltas, or an upstream error after the headers),
     // and recording those would report an observation that never happened.
     if (Object.keys(merged).length) {
-      accountManager.recordTokenUsage(accountIndex, pinKey, model, merged);
+      accountManager.recordTokenUsage(accountIndex, pinKey, model, merged, sessionKey);
     }
     // Cancel upstream reader to stop consuming data nobody needs (and, on the
     // timeout path, to destroy the dead socket so the pool drops it).
@@ -3403,7 +3418,7 @@ function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, me
   }
 }
 
-function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = null, pinKey = null, model = null) {
+function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = null, pinKey = null, model = null, sessionKey = null) {
   try {
     const json = JSON.parse(buffer.toString());
     if (json.usage) {
@@ -3419,7 +3434,7 @@ function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = nu
       if (!usage) return;
       accountManager.updateUsage(accountIndex, usage.input_tokens, usage.output_tokens);
       onUsage?.(usage.input_tokens || 0, usage.output_tokens || 0);
-      accountManager.recordTokenUsage(accountIndex, pinKey, model, usage);
+      accountManager.recordTokenUsage(accountIndex, pinKey, model, usage, sessionKey);
     }
   } catch {
     // not JSON or no usage
