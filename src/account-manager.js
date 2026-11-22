@@ -1,3 +1,4 @@
+import { appendUsageLog } from './cache-ttl.js';
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired, formatMoney } from './oauth.js';
 import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount, canServeProvider } from './provider.js';
 import { refreshCodexToken } from './codex-auth.js';
@@ -4318,8 +4319,13 @@ export class AccountManager {
    * ones are published for an operator to read and are not consulted by
    * selection.
    */
-  recordTokenUsage(accountIndex, sessionId, model, usage) {
+  recordTokenUsage(accountIndex, sessionId, model, usage, sessionKey = null) {
     if (!usage) return;
+    // Opt-in per-response ledger (TEAMCLAUDE_USAGE_LOG; src/cache-ttl.js).
+    if (process.env.TEAMCLAUDE_USAGE_LOG) {
+      const acct = this.accounts[accountIndex];
+      appendUsageLog({ account: acct?.name, bucket: this._weeklyBucketFor(model), model, sessionKey, usage, util7d: acct?.quota?.unified7d });
+    }
     // The same resolver routing uses, so a token total and a routing decision
     // agree about which family a request belonged to. Resolved here rather than
     // at the call sites: they parse a wire format and have no business knowing
