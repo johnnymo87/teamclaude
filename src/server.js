@@ -477,6 +477,14 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'model is required' } }));
           return;
         }
+        // With sessions distributed, a request with no session id is spread
+        // across accounts rather than sent to the preview's account, so there
+        // is no single answer. Said so, with no id, rather than a wrong one.
+        if (accountManager.distributeSessions) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ model, unpredictable: 'sessions are distributed across accounts' }));
+          return;
+        }
         const index = accountManager.previewRouteIndex(model, DEFAULT_PROVIDER);
         const id = index == null ? null : accountManager.accounts[index]?.id;
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1080,6 +1088,9 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // one account, bypassing rotation. Used by the keep-warm scheduler and for
       // manual per-account testing. The prefix is stripped before forwarding.
       let pinnedIndex = null;
+      // The pinned account itself, taken the moment the pin resolves: the body
+      // is read after this, and removing an account renumbers the array.
+      let pinnedAccount = null;
       // DEPRECATED: the path-prefix pin. Superseded by TC_ACCT, which works in
       // MITM mode too (this form cannot — inside a CONNECT tunnel the path is
       // the real upstream one). Kept for the warmer and for direct API callers.
@@ -1100,6 +1111,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         let token = null;
         try { token = decodeURIComponent(raw); } catch { token = null; }
         pinnedIndex = token == null ? null : resolveAccountPin(accountManager, token);
+        pinnedAccount = pinnedIndex == null ? null : accountManager.accounts[pinnedIndex] ?? null;
         if (pinnedIndex == null) {
           // Client-supplied and already percent-decoded, so this is the one
           // value on the path that can carry raw control bytes.
@@ -1147,6 +1159,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // is open, and a name outliving an index is the safer half of that race.
       if (pinnedIndex == null && forcedPin != null) {
         pinnedIndex = resolveAccountPin(accountManager, forcedPin);
+        pinnedAccount = pinnedIndex == null ? null : accountManager.accounts[pinnedIndex] ?? null;
         if (pinnedIndex == null) {
           const reqId = ++counter;
           const sessionId = clientSessionId(req.headers);
@@ -1261,7 +1274,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // are dropped with the other proxy-control headers.
       const stripHeaders = usageDimensionHeaderNames(config.proxy);
 
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, pinnedAccount: pinnedIndex == null ? null : accountManager.accounts[pinnedIndex] ?? null, provider, holdBudgetMs: holdMs, pinKey, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, pinnedAccount, provider, holdBudgetMs: holdMs, pinKey, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.

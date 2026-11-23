@@ -265,3 +265,43 @@ test('an id two accounts share resolves to neither', () => {
   am.accounts[1].id = ALPHA_ID;
   assert.equal(resolveAccountPin(am, ALPHA_ID), null);
 });
+
+// The pin is resolved from the URL before the body is read. An account removed
+// while the body is still arriving must not move it either.
+test('a pin resolved before the body arrives survives renumbering during body intake', async () => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => { seen.push(req.headers.authorization); ok(req, res); });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([
+    oauth('alpha', ALPHA_ID), oauth('beta', BETA_ID), oauth('gamma', '33333333-3333-4333-8333-333333333333'),
+  ], 0.98);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+  try {
+    const body = JSON.stringify({ model: 'claude-sonnet-4-5', messages: [{ role: 'user', content: 'hi' }] });
+    const status = await new Promise((resolve, reject) => {
+      const req = http.request({
+        host: '127.0.0.1', port: proxyPort, method: 'POST', path: `/tc-acct/${BETA_ID}/v1/messages`,
+        headers: { 'content-type': 'application/json', 'x-api-key': 'k', 'content-length': Buffer.byteLength(body) },
+      }, (res) => { res.resume(); res.on('end', () => resolve(res.statusCode)); });
+      req.on('error', reject);
+      req.write(body.slice(0, 10));
+      setTimeout(() => { am.removeAccount(0); req.end(body.slice(10)); }, 100);
+    });
+    assert.equal(status, 200);
+    assert.deepEqual(seen, ['Bearer t-beta']);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('/teamclaude/route-target declines to predict while sessions are distributed', async () => {
+  await withProxy(ok, async ({ proxyPort, am }) => {
+    am.distributeSessions = true;
+    const { status, body } = await target(proxyPort, 'claude-sonnet-4-5');
+    assert.equal(status, 200);
+    assert.equal('id' in body, false);
+    assert.equal(typeof body.unpredictable, 'string');
+  });
+});
