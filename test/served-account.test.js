@@ -178,3 +178,90 @@ test('an unpinned request still takes the one-hop 5xx detour', async () => {
     assert.equal(res.headers.get(SERVED_ACCOUNT_HEADER), seen[1].auth.includes('beta') ? BETA_ID : ALPHA_ID);
   });
 });
+
+// Where would a request for this model land right now? A keep-warm poke is
+// worth sending only to the account the conversation's next request will use:
+// refreshing a cache there is a read, refreshing it anywhere else is waste.
+// Requests with no session id (cfp's) have no affinity, so the answer is the
+// fleet's preview for the model, the same one the TUI draws.
+const target = async (port, model) => {
+  const q = model == null ? '' : `?model=${encodeURIComponent(model)}`;
+  const res = await fetch(`http://127.0.0.1:${port}/teamclaude/route-target${q}`, { headers: { 'x-api-key': 'k' } });
+  return { status: res.status, body: await res.json() };
+};
+
+test('/teamclaude/route-target names the account a request for the model would land on', async () => {
+  await withProxy(ok, async ({ proxyPort, am }) => {
+    am.currentIndex = 1;
+    assert.deepEqual(await target(proxyPort, 'claude-sonnet-4-5'), { status: 200, body: { model: 'claude-sonnet-4-5', id: BETA_ID } });
+    am.currentIndex = 0;
+    assert.equal((await target(proxyPort, 'claude-sonnet-4-5')).body.id, ALPHA_ID);
+    // An account out of rotation is never the target.
+    am.accounts[0].disabled = true;
+    assert.equal((await target(proxyPort, 'claude-sonnet-4-5')).body.id, BETA_ID);
+    am.accounts[1].disabled = true;
+    assert.equal((await target(proxyPort, 'claude-sonnet-4-5')).body.id, null);
+  });
+});
+
+test('/teamclaude/route-target agrees with where the request then goes', async () => {
+  await withProxy(ok, async ({ proxyPort, am, seen }) => {
+    am.currentIndex = 1;
+    const { body } = await target(proxyPort, 'claude-sonnet-4-5');
+    const res = await post(`http://127.0.0.1:${proxyPort}/v1/messages`);
+    await res.text();
+    assert.equal(res.headers.get(SERVED_ACCOUNT_HEADER), body.id);
+    assert.equal(seen.length, 1);
+  });
+});
+
+test('/teamclaude/route-target without a model is a 400', async () => {
+  await withProxy(ok, async ({ proxyPort }) => {
+    const { status, body } = await target(proxyPort, null);
+    assert.equal(status, 400);
+    assert.equal(body.error.type, 'invalid_request_error');
+  });
+});
+
+// A pin is resolved to an array position once, and removing an account
+// renumbers the array. A retry inside the same request (here: the forced token
+// refresh after a 401) must follow the pinned account, not the position.
+test('a pinned request whose account is renumbered mid-request stays on that account', async () => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    seen.push(req.headers.authorization);
+    if (seen.length === 1) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'authentication_error', message: 'expired' } }));
+      return;
+    }
+    ok(req, res);
+  });
+  const upstreamPort = await listen(upstream);
+  let am;
+  const refreshFn = async () => {
+    am.removeAccount(0); // beta moves from index 1 to 0, gamma from 2 to 1
+    return { accessToken: 't-beta-2', refreshToken: 'r2', expiresAt: Date.now() + 3600_000 };
+  };
+  am = new AccountManager([
+    oauth('alpha', ALPHA_ID), oauth('beta', BETA_ID), oauth('gamma', '33333333-3333-4333-8333-333333333333'),
+  ], 0.98, { refreshFn, forcedRefreshFloorMs: 0 });
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+  try {
+    const res = await post(`http://127.0.0.1:${proxyPort}/tc-acct/${BETA_ID}/v1/messages`);
+    await res.text();
+    assert.equal(seen[0], 'Bearer t-beta');
+    for (const a of seen.slice(1)) assert.ok(!a.includes('gamma'), `the pin moved to gamma: ${seen.join(', ')}`);
+    if (res.status === 200) assert.equal(res.headers.get(SERVED_ACCOUNT_HEADER), BETA_ID);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('an id two accounts share resolves to neither', () => {
+  const am = new AccountManager([oauth('alpha', ALPHA_ID), oauth('beta', BETA_ID)], 0.98);
+  am.accounts[1].id = ALPHA_ID;
+  assert.equal(resolveAccountPin(am, ALPHA_ID), null);
+});

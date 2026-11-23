@@ -464,6 +464,26 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
+      // Where an Anthropic request for `model` with no session id would land
+      // right now, by entry id (SERVED_ACCOUNT_HEADER's form); null when nothing
+      // can serve it or the account has no id. The read-only preview the TUI
+      // draws, so asking moves nothing. A keep-warm caller (cfp) asks before
+      // refreshing a cache: a refresh is worth sending only to the account the
+      // conversation's next request will use.
+      if (req.method === 'GET' && (req.url === '/teamclaude/route-target' || req.url?.startsWith('/teamclaude/route-target?'))) {
+        const model = new URL(req.url, 'http://localhost').searchParams.get('model');
+        if (!model) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'model is required' } }));
+          return;
+        }
+        const index = accountManager.previewRouteIndex(model, DEFAULT_PROVIDER);
+        const id = index == null ? null : accountManager.accounts[index]?.id;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ model, id: typeof id === 'string' && id !== '' ? id : null }));
+        return;
+      }
+
       // Tier-weighted fleet quota for lightweight consumers such as a shell or
       // Claude Code status line. Unlike /teamclaude/status this omits routing,
       // usage counters and server diagnostics, and never reaches upstream.
@@ -824,7 +844,11 @@ export function resolveAccountPin(accountManager, token) {
   const at = (pick) => accounts.findIndex(a => norm(pick(a)) === t);
   // The entry id first: it is the form this proxy itself hands out
   // (SERVED_ACCOUNT_HEADER), unique by construction, and never reused.
-  const byId = accounts.findIndex(a => typeof a.id === 'string' && a.id !== '' && norm(a.id) === t);
+  // Two running accounts sharing one should not happen (ensureAccountIds
+  // re-mints a duplicate), but if it did the id names neither: no match.
+  const idMatches = accounts.flatMap((a, i) => (typeof a.id === 'string' && a.id !== '' && norm(a.id) === t ? [i] : []));
+  if (idMatches.length > 1) return null;
+  const byId = idMatches.length === 1 ? idMatches[0] : -1;
   const qualified = accounts.findIndex(a => a.accountUuid && a.orgUuid
     && `${norm(a.accountUuid)}/${norm(a.orgUuid)}` === t);
 
@@ -1237,7 +1261,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // are dropped with the other proxy-control headers.
       const stripHeaders = usageDimensionHeaderNames(config.proxy);
 
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, pinnedAccount: pinnedIndex == null ? null : accountManager.accounts[pinnedIndex] ?? null, provider, holdBudgetMs: holdMs, pinKey, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -2296,7 +2320,16 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // pinned request never reaches that walk, and a budget a pin can spend past is
   // not a budget. The request gets the exhausted response, exactly as it would
   // for an already-tried pin — it still never leaks to another account.
-  const pinned = ctx.pinnedIndex != null && !ctx.tried.has(ctx.pinnedIndex)
+  // The pin is held as the account object, not only its position: removing an
+  // account renumbers the array, and a retry inside this request (a forced
+  // token refresh, a wait) must follow the account rather than land on
+  // whichever one slid into its old slot. Gone from the fleet = unavailable.
+  if (ctx.pinnedAccount) {
+    const at = accountManager.accounts.indexOf(ctx.pinnedAccount);
+    if (at < 0) ctx.pinnedGone = true;
+    else ctx.pinnedIndex = at;
+  }
+  const pinned = ctx.pinnedIndex != null && !ctx.pinnedGone && !ctx.tried.has(ctx.pinnedIndex)
     ? accountManager.accounts[ctx.pinnedIndex]
     : null;
   // What this attempt's selection decided beyond which account it returned.
@@ -2314,7 +2347,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // The hop's destination was picked by pickAlternate against this request's
   // own exclusions, and is taken as-is: re-selecting here would walk the fleet
   // cursor onto it, which is exactly the move a detour must not make (#286).
-  const account = hopTo != null
+  // A pin outranks a hop destination, so a hop site that forgets the pin
+  // cannot move a pinned request (the two that did are now guarded too).
+  const account = hopTo != null && ctx.pinnedIndex == null
     ? accountManager.accounts[hopTo]
     : ctx.pinnedIndex != null
       ? (pinned && !pinnedWrongProvider && !accountManager.capExceeded(pinned, ctx.model) ? pinned : null)
