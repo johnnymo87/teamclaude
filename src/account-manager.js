@@ -4966,6 +4966,9 @@ export class AccountManager {
       marginMove: { ...this.marginMove },
       spread: this._weeklySpreadByProvider(allW),
       accounts: this.accounts.map((a, i) => ({
+        // The config entry id: opaque, and the form SERVED_ACCOUNT_HEADER
+        // reports, so a reader can match a served response to its account.
+        id: a.id ?? null,
         name: a.name,
         type: a.type,
         provider: providerOf(a),

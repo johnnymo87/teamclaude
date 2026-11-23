@@ -36,6 +36,16 @@ export const HOP_BY_HOP_HEADERS = new Set([
 const PIN_PREFIX = '/tc-acct/';
 
 /**
+ * Response header naming the account that served a forwarded request, by its
+ * config entry id (account-id.js) — an opaque random UUID, never the account's
+ * name, which is usually an email address. The id is also an accepted pin
+ * (resolveAccountPin), so a caller can send a later request to the account that
+ * served an earlier one: cfp's keep-warm poke does, because a prompt cache lives
+ * on one account and refreshing it anywhere else writes a new one instead.
+ */
+export const SERVED_ACCOUNT_HEADER = 'x-teamclaude-account-id';
+
+/**
  * Does the request path carry a dot-segment (`.` or `..`, in any percent-encoded
  * spelling, on either slash)?
  *
@@ -454,6 +464,34 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
+      // Where an Anthropic request for `model` with no session id would land
+      // right now, by entry id (SERVED_ACCOUNT_HEADER's form); null when nothing
+      // can serve it or the account has no id. The read-only preview the TUI
+      // draws, so asking moves nothing. A keep-warm caller (cfp) asks before
+      // refreshing a cache: a refresh is worth sending only to the account the
+      // conversation's next request will use.
+      if (req.method === 'GET' && (req.url === '/teamclaude/route-target' || req.url?.startsWith('/teamclaude/route-target?'))) {
+        const model = new URL(req.url, 'http://localhost').searchParams.get('model');
+        if (!model) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'model is required' } }));
+          return;
+        }
+        // With sessions distributed, a request with no session id is spread
+        // across accounts rather than sent to the preview's account, so there
+        // is no single answer. Said so, with no id, rather than a wrong one.
+        if (accountManager.distributeSessions) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ model, unpredictable: 'sessions are distributed across accounts' }));
+          return;
+        }
+        const index = accountManager.previewRouteIndex(model, DEFAULT_PROVIDER);
+        const id = index == null ? null : accountManager.accounts[index]?.id;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ model, id: typeof id === 'string' && id !== '' ? id : null }));
+        return;
+      }
+
       // Tier-weighted fleet quota for lightweight consumers such as a shell or
       // Claude Code status line. Unlike /teamclaude/status this omits routing,
       // usage counters and server diagnostics, and never reaches upstream.
@@ -812,10 +850,18 @@ export function resolveAccountPin(accountManager, token) {
   if (!t) return null;
 
   const at = (pick) => accounts.findIndex(a => norm(pick(a)) === t);
+  // The entry id first: it is the form this proxy itself hands out
+  // (SERVED_ACCOUNT_HEADER), unique by construction, and never reused.
+  // Two running accounts sharing one should not happen (ensureAccountIds
+  // re-mints a duplicate), but if it did the id names neither: no match.
+  const idMatches = accounts.flatMap((a, i) => (typeof a.id === 'string' && a.id !== '' && norm(a.id) === t ? [i] : []));
+  if (idMatches.length > 1) return null;
+  const byId = idMatches.length === 1 ? idMatches[0] : -1;
   const qualified = accounts.findIndex(a => a.accountUuid && a.orgUuid
     && `${norm(a.accountUuid)}/${norm(a.orgUuid)}` === t);
 
   for (const i of [
+    byId,
     qualified,
     at(a => a.accountUuid),
     at(a => a.orgUuid),
@@ -1042,6 +1088,9 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // one account, bypassing rotation. Used by the keep-warm scheduler and for
       // manual per-account testing. The prefix is stripped before forwarding.
       let pinnedIndex = null;
+      // The pinned account itself, taken the moment the pin resolves: the body
+      // is read after this, and removing an account renumbers the array.
+      let pinnedAccount = null;
       // DEPRECATED: the path-prefix pin. Superseded by TC_ACCT, which works in
       // MITM mode too (this form cannot — inside a CONNECT tunnel the path is
       // the real upstream one). Kept for the warmer and for direct API callers.
@@ -1062,6 +1111,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         let token = null;
         try { token = decodeURIComponent(raw); } catch { token = null; }
         pinnedIndex = token == null ? null : resolveAccountPin(accountManager, token);
+        pinnedAccount = pinnedIndex == null ? null : accountManager.accounts[pinnedIndex] ?? null;
         if (pinnedIndex == null) {
           // Client-supplied and already percent-decoded, so this is the one
           // value on the path that can carry raw control bytes.
@@ -1109,6 +1159,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // is open, and a name outliving an index is the safer half of that race.
       if (pinnedIndex == null && forcedPin != null) {
         pinnedIndex = resolveAccountPin(accountManager, forcedPin);
+        pinnedAccount = pinnedIndex == null ? null : accountManager.accounts[pinnedIndex] ?? null;
         if (pinnedIndex == null) {
           const reqId = ++counter;
           const sessionId = clientSessionId(req.headers);
@@ -1223,7 +1274,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // are dropped with the other proxy-control headers.
       const stripHeaders = usageDimensionHeaderNames(config.proxy);
 
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, pinnedAccount, provider, holdBudgetMs: holdMs, pinKey, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -2282,7 +2333,16 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // pinned request never reaches that walk, and a budget a pin can spend past is
   // not a budget. The request gets the exhausted response, exactly as it would
   // for an already-tried pin — it still never leaks to another account.
-  const pinned = ctx.pinnedIndex != null && !ctx.tried.has(ctx.pinnedIndex)
+  // The pin is held as the account object, not only its position: removing an
+  // account renumbers the array, and a retry inside this request (a forced
+  // token refresh, a wait) must follow the account rather than land on
+  // whichever one slid into its old slot. Gone from the fleet = unavailable.
+  if (ctx.pinnedAccount) {
+    const at = accountManager.accounts.indexOf(ctx.pinnedAccount);
+    if (at < 0) ctx.pinnedGone = true;
+    else ctx.pinnedIndex = at;
+  }
+  const pinned = ctx.pinnedIndex != null && !ctx.pinnedGone && !ctx.tried.has(ctx.pinnedIndex)
     ? accountManager.accounts[ctx.pinnedIndex]
     : null;
   // What this attempt's selection decided beyond which account it returned.
@@ -2300,7 +2360,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // The hop's destination was picked by pickAlternate against this request's
   // own exclusions, and is taken as-is: re-selecting here would walk the fleet
   // cursor onto it, which is exactly the move a detour must not make (#286).
-  const account = hopTo != null
+  // A pin outranks a hop destination, so a hop site that forgets the pin
+  // cannot move a pinned request (the two that did are now guarded too).
+  const account = hopTo != null && ctx.pinnedIndex == null
     ? accountManager.accounts[hopTo]
     : ctx.pinnedIndex != null
       ? (pinned && !pinnedWrongProvider && !accountManager.capExceeded(pinned, ctx.model) ? pinned : null)
@@ -2751,7 +2813,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // hop ctx.rateLimitHopped is set, this branch does not run again for this
       // request, and the sx fresh-IP retry and the inline wait take over —
       // which is the right response to an IP-scoped limit.
-      if (!ctx.rateLimitHopped && retryCount < maxRetries) {
+      //
+      // Never for a pinned request (TC_ACCT, /tc-acct/): a pin names the one
+      // account the client asked for and never fails over (see the selection
+      // above). Backported from upstream, which added the same guard.
+      if (ctx.pinnedIndex == null && !ctx.rateLimitHopped && retryCount < maxRetries) {
         // ctx.rolledOff as well as tried: an account a rollover moved this
         // request off was never sent a request, so it is not in `tried`, and
         // hopping back onto it would reverse that decision one step later.
@@ -2905,7 +2971,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // overloaded, not the account, and walking the fleet would just spend every
     // account'"'"'s cache discovering that. After the hop the response goes to the
     // client as it does today, with its own retry-after intact.
-    if (upstreamRes.status >= 500 && !res.headersSent && !ctx.serverErrorHopped && retryCount < maxRetries) {
+    // Never for a pinned request, as for the 429 hop above.
+    if (ctx.pinnedIndex == null && upstreamRes.status >= 500 && !res.headersSent && !ctx.serverErrorHopped && retryCount < maxRetries) {
       // Same exclusion as the 429 hop, and the same cursor-preserving pick.
       const alt = accountManager.pickAlternate(
         new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
@@ -3005,6 +3072,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (key === 'content-encoding' || key === 'content-length') continue;
       responseHeaders[key] = value;
     }
+    // Ours alone: whatever upstream sent under this name is dropped, and an
+    // account with no entry id is reported as nothing rather than guessed at.
+    delete responseHeaders[SERVED_ACCOUNT_HEADER];
+    if (typeof account.id === 'string' && account.id !== '') responseHeaders[SERVED_ACCOUNT_HEADER] = account.id;
 
     res.writeHead(upstreamRes.status, responseHeaders);
 
