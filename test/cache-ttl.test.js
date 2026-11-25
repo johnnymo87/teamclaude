@@ -89,12 +89,13 @@ test('usage ledger line and append', () => {
 });
 
 // ---- name rule: goose sessions matched by their name in goose's sessions.db ----
-import { DatabaseSync } from 'node:sqlite';
+const sqlite = process.getBuiltinModule?.('node:sqlite'); // absent on Node 20
+const nr = { skip: !sqlite && 'node:sqlite unavailable' };
 import { _resetNameCache } from '../src/cache-ttl.js';
 
 function gooseDb(rows) {
   const p = join(mkdtempSync(join(tmpdir(), 'tc-goose-')), 'sessions.db');
-  const db = new DatabaseSync(p);
+  const db = new sqlite.DatabaseSync(p);
   db.exec('create table sessions (id text primary key, name text)');
   const ins = db.prepare('insert into sessions (id, name) values (?, ?)');
   for (const [id, name] of rows) ins.run(id, name);
@@ -107,7 +108,7 @@ function nameRule(dbPath, extra = {}) {
   return loadTtlRule(f);
 }
 
-test('name rule: goose id whose name matches a glob gets the ttl; others do not', () => {
+test('name rule: goose id whose name matches a glob gets the ttl; others do not', nr, () => {
   _resetNameCache();
   const { p } = gooseDb([['20261125_2', 'live-window-1125a'], ['20261104_3', 'stallwatch-eternal-machinery-1793823783127'], ['20261123_16', 'Delegated task']]);
   const rule = nameRule(p);
@@ -118,7 +119,7 @@ test('name rule: goose id whose name matches a glob gets the ttl; others do not'
   assert.equal(ttlForRequest({ 'x-session-affinity': 'ses_live-window-x' }, rule), null, 'non-goose ids are never looked up');
 });
 
-test('name rule: glob is anchored and case-insensitive; regex metacharacters are literal', () => {
+test('name rule: glob is anchored and case-insensitive; regex metacharacters are literal', nr, () => {
   _resetNameCache();
   const { p } = gooseDb([['20261125_1', 'LIVE-WINDOW-1125B'], ['20261125_3', 'my live-window-x'], ['20261125_4', 'stallwatch.x'], ['20261125_5', 'a.b']]);
   const rule = nameRule(p, { names: ['live-window-*', 'a.b'] });
@@ -130,9 +131,9 @@ test('name rule: glob is anchored and case-insensitive; regex metacharacters are
   assert.equal(ttlForRequest({ 'x-session-id': '20261125_6' }, nameRule(p2, { names: ['a.b'] })), null, '. is literal');
 });
 
-test('name rule: a name set after the first request is picked up once the miss expires', () => {
+test('name rule: a placeholder renamed after the first request is picked up once the miss expires', nr, () => {
   _resetNameCache();
-  const { p, db } = gooseDb([['20261126_1', null]]);
+  const { p, db } = gooseDb([['20261126_1', 'CLI Session']]); // goose placeholder, renamed later
   const rule = nameRule(p);
   let now = 1_000_000;
   assert.equal(ttlForRequest({ 'x-session-id': '20261126_1' }, rule, () => now), null);
@@ -141,7 +142,7 @@ test('name rule: a name set after the first request is picked up once the miss e
   assert.equal(ttlForRequest({ 'x-session-id': '20261126_1' }, rule, () => now + 60_000), '1h');
 });
 
-test('name rule: missing or broken db, or no names, is inert and never throws', () => {
+test('name rule: missing or broken db, or no names, is inert and never throws', nr, () => {
   _resetNameCache();
   assert.equal(ttlForRequest({ 'x-session-id': '20261125_2' }, nameRule(join(dir, 'no-such.db'))), null);
   const bad = join(dir, 'garbage.db'); writeFileSync(bad, 'not a database at all, just text padding padding padding');
@@ -152,7 +153,7 @@ test('name rule: missing or broken db, or no names, is inert and never throws', 
   assert.equal(ttlForRequest({ 'x-session-id': '20261125_2' }, nameRule(p, { names: 'live-window-*' })), null, 'non-array names ignored');
 });
 
-test('name rule: listed sessions still match without a db', () => {
+test('name rule: listed sessions still match without a db', nr, () => {
   _resetNameCache();
   const rule = nameRule(null, { sessions: ['20261125_2'] });
   assert.equal(ttlForRequest({ 'x-session-id': '20261125_2' }, rule), '1h');

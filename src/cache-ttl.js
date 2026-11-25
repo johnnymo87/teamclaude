@@ -20,8 +20,8 @@
 //                                               anchored, case-insensitive
 //   "gooseSessionsDb": "/home/dev/.local/share/goose/sessions/sessions.db"
 // An id of goose's shape that is not listed is looked up read-only in that
-// database. Results are cached briefly (a hit for 10 minutes, a miss for 30
-// seconds, because goose may name a session only after its first request), so
+// database. Results are cached briefly (a matching name for 10 minutes, anything else
+// for 30 seconds, because goose may rename a session after its first request), so
 // the database sees at most a couple of point queries a minute per session.
 // Any database error means "no match": the lookup never breaks a request.
 //
@@ -87,7 +87,7 @@ export function _resetNameCache() {
   dbHandle = { path: null, db: null, openedAt: 0 };
 }
 
-function gooseName(dbPath, id, nowMs) {
+function gooseName(dbPath, id, nowMs, matches) {
   const key = `${dbPath}\0${id}`;
   const hit = nameCache.get(key);
   if (hit && hit.until > nowMs) return hit.name;
@@ -106,14 +106,17 @@ function gooseName(dbPath, id, nowMs) {
     dbHandle = { path: null, db: null, openedAt: 0 };
   }
   if (nameCache.size >= MAX_CACHED) nameCache.clear();
-  nameCache.set(key, { name, until: nowMs + (name ? HIT_MS : MISS_MS) });
+  // A name that does not match yet may be a placeholder renamed later, so only
+  // a MATCHING name is kept for long.
+  nameCache.set(key, { name, until: nowMs + (name && matches(name) ? HIT_MS : MISS_MS) });
   return name;
 }
 
 function nameMatches(rule, id, nowMs) {
   if (!id || !GOOSE_ID.test(id)) return false;
-  const name = gooseName(rule.gooseSessionsDb, id, nowMs);
-  return !!name && rule.names.some(re => re.test(name));
+  const matches = (name) => rule.names.some(re => re.test(name));
+  const name = gooseName(rule.gooseSessionsDb, id, nowMs, matches);
+  return !!name && matches(name);
 }
 
 // The TTL to apply to this request, or null.
