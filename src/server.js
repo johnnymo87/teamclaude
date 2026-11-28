@@ -2581,7 +2581,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     try { ttlChoice = ttlDecision(req.headers); } catch { /* never break a request */ }
     if (ttlChoice.ttl) sendBody = applyCacheTtl(sendBody, ttlChoice.ttl);
   }
-  ctx.sessionHeaders = { ...sessionHeaders(req.headers), ttl: ttlChoice.ttl, ttlReason: ttlChoice.reason, reqStartMs: Date.now() };
+  ctx.sessionHeaders = { ...sessionHeaders(req.headers), ttl: ttlChoice.ttl, ttlReason: ttlChoice.reason };
   // If the body changed length (sanitize, model rewrite, or field strip), update
   // Content-Length so the upstream doesn't receive a mismatched framing and
   // truncate or stall.
@@ -2633,6 +2633,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     }
     let upstreamRes;
     let admittedLoad = 0;
+    // The adaptive cache-TTL rule times gaps from here: after any admission wait.
+    if (ctx.sessionHeaders) ctx.sessionHeaders.reqStartMs = Date.now();
     try {
       upstreamRes = await upstreamFetch(upstreamUrl, {
         method,

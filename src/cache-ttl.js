@@ -47,7 +47,8 @@
 // window, without flapping on a single gap. Defaults: minEvents 6, minMidGaps
 // 2, onAbove 100000, offBelow -50000, windowHours 24. State is in memory; after a restart
 // it is rebuilt once from the tail of the usage ledger (`"replay": false` turns
-// that off). Each decision is written to the ledger as `ttl` / `ttl_reason`.
+// that off; then each session's first request after a restart is scored as a
+// first write, even if its cache is still warm). Each decision is written to the ledger as `ttl` / `ttl_reason`.
 //
 // USAGE LEDGER. With TEAMCLAUDE_USAGE_LOG set, every settled Anthropic response
 // appends one JSON line: time, account, weekly bucket, model, the request's
@@ -256,6 +257,7 @@ export function replayUsageLog(path, rule = loadTtlRule(), now = Date.now(), max
   const since = new Date(now - cfg.windowMs).toISOString();
   const until = new Date(now).toISOString();
   const CHUNK = 1024 * 1024;
+  const chunks = [];
   let text = '';
   try {
     const fd = openSync(path, 'r');
@@ -267,15 +269,16 @@ export function replayUsageLog(path, rule = loadTtlRule(), now = Date.now(), max
         pos -= len;
         const buf = Buffer.alloc(len);
         readSync(fd, buf, 0, len, pos);
-        text = buf.toString('latin1') + text;
-        const nl = text.indexOf('\n');
-        // Stop once the first complete line in hand is older than the window.
-        if (pos > 0 && nl >= 0 && text.slice(nl + 8, nl + 32) < since) break;
+        chunks.unshift(buf);
+        // Stop once this chunk's first complete line is older than the window
+        // (a line split across chunks only delays the stop by one chunk).
+        const nl = buf.indexOf(10);
+        if (pos > 0 && nl >= 0 && buf.toString('latin1', nl + 8, nl + 32) < since) break;
       }
+      text = Buffer.concat(chunks).toString('utf8');
       if (pos > 0) text = text.slice(text.indexOf('\n') + 1);
     } finally { closeSync(fd); }
   } catch { return 0; }
-  text = Buffer.from(text, 'latin1').toString('utf8');
   const rows = [];
   for (const line of text.split('\n')) {
     // `ts` is the first key; compare it as text before paying for a parse.
@@ -285,6 +288,8 @@ export function replayUsageLog(path, rule = loadTtlRule(), now = Date.now(), max
     try { r = JSON.parse(line); } catch { continue; }
     const t = Date.parse(r.req_ts ?? r.ts);
     if (!r.session || !Number.isFinite(t)) continue;
+    // Rows written with no TTL decision (non-Anthropic bodies) were never observed live.
+    if ('ttl_reason' in r && r.ttl_reason == null) continue;
     rows.push({ t, r });
   }
   rows.sort((a, b) => a.t - b.t);

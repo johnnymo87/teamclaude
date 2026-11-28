@@ -114,11 +114,12 @@ test('requests without cache are ignored and models are scored separately', () =
 test('replayUsageLog rebuilds state from the ledger window', () => {
   const rule = ruleFile();
   const log = join(dir, 'usage.jsonl'); writeFileSync(log, '');
-  const line = (ts, session) => usageLogLine({ account: 'a', model: 'm', sessionKey: { session }, usage: usage(100000), now: ts });
+  const line = (ts, session) => usageLogLine({ account: 'a', model: 'm', sessionKey: { session, ttlReason: session === 'ses_codex' ? null : 'prior-none' }, usage: usage(100000), now: ts });
   appendFileSync(log, line(T0 - 48 * 60 * MIN, 'ses_old') + '\nnot json\n');
-  for (let i = 0; i < 4; i++) appendFileSync(log, line(T0 + i * 30 * MIN, 'ses_r') + '\n');
+  for (let i = 0; i < 4; i++) appendFileSync(log, line(T0 + i * 30 * MIN, 'ses_r') + '\n' + line(T0 + i * 30 * MIN, 'ses_codex') + '\n');
   const now = T0 + 4 * 30 * MIN;
-  assert.equal(replayUsageLog(log, rule, now), 4);
+  assert.equal(replayUsageLog(log, rule, now), 4, 'rows without a TTL decision are skipped');
+  assert.deepEqual(ttlDecision({ 'x-session-id': 'ses_codex' }, rule, () => now), { ttl: null, reason: 'prior-none' });
   assert.deepEqual(ttlDecision({ 'x-session-id': 'ses_r' }, rule, () => now), { ttl: '1h', reason: 'adaptive-on' });
 });
 
@@ -154,7 +155,7 @@ test("a parent's undecided state starts from the parent's own prior, not the chi
 test('replay prefers req_ts and does not score a replayed first line', () => {
   const rule = ruleFile({ adaptive: { enabled: true, minEvents: 1, onAbove: 1, offBelow: -1, minMidGaps: 0, windowHours: 24, replay: false } });
   const log = join(dir, 'usage2.jsonl');
-  const line = (ts, req) => usageLogLine({ model: 'm', sessionKey: { session: 'ses_q', reqStartMs: req }, usage: usage(100000), now: ts });
+  const line = (ts, req) => usageLogLine({ model: 'm', sessionKey: { session: 'ses_q', reqStartMs: req, ttlReason: 'prior-none' }, usage: usage(100000), now: ts });
   // Settle times 4 min apart, but the requests started 10 min apart: a 5-60 min gap.
   writeFileSync(log, line(T0 + 2 * MIN, T0) + '\n' + line(T0 + 6 * MIN, T0 + 10 * MIN) + '\n');
   assert.equal(replayUsageLog(log, rule, T0 + 20 * MIN), 2);
