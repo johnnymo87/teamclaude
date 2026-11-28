@@ -27,21 +27,25 @@
 //
 // ADAPTIVE RULE. With `"adaptive": {"enabled": true}` the id list and the
 // names become only a PRIOR, and each session's own recent traffic decides.
-// From every settled response we know the prompt size (input + cache read +
-// cache write) and the time since the session's previous response for the same
-// model, which is enough to price that request under both TTLs whatever TTL it
-// actually used (`scoreGap`, the same loss rule as the daily audit):
+// From every settled response we know the cached prompt size (cache read +
+// cache write, the same under either TTL) and the time since the session's
+// previous request for the same model (request START times, since the cache is
+// touched at prefill, not when a long stream ends). That is enough to price the
+// request under both TTLs whatever TTL it actually used (`scoreGap`, the same
+// loss rule as the daily audit):
+//   first request  1h pays 0.6 x the whole write
 //   gap <= 5 min   both warm; 1h pays 0.6 x the newly cached tokens
 //   5-60 min       only 1h is warm; it saves the shared prefix, minus that premium
 //   > 60 min       both cold; 1h pays 0.6 x the whole rewrite
-// (and a context that shrank by more than half is a cold rewrite either way).
+// (and a cache that shrank by more than half is a cold rewrite either way).
 // The scores of the last `windowHours` are summed per session. Once a session
 // has `minEvents` scored requests, 1h goes on when the sum reaches `onAbove`
-// and off when it falls to `offBelow`; in between it keeps its state, which
-// starts from the prior. A subagent without enough evidence of its own follows
+// AND at least `minMidGaps` of them were 5-60 min gaps, and off when the sum
+// falls to `offBelow`; in between it keeps its state, which starts from the
+// prior. A session whose window empties forgets its state. A subagent without enough evidence of its own follows
 // its parent's state. So a program that changes phase is followed within a
-// window, without flapping on a single gap. Defaults: minEvents 6, onAbove
-// 100000, offBelow -50000, windowHours 24. State is in memory; after a restart
+// window, without flapping on a single gap. Defaults: minEvents 6, minMidGaps
+// 2, onAbove 100000, offBelow -50000, windowHours 24. State is in memory; after a restart
 // it is rebuilt once from the tail of the usage ledger (`"replay": false` turns
 // that off). Each decision is written to the ledger as `ttl` / `ttl_reason`.
 //
@@ -55,13 +59,14 @@ import { statSync, readFileSync, appendFileSync, openSync, fstatSync, readSync, 
 
 const VALID_TTLS = new Set(['5m', '1h']);
 const EMPTY = () => ({ ttl: null, sessions: new Set(), names: [], gooseSessionsDb: null, adaptive: null });
-const ADAPTIVE_DEFAULTS = { minEvents: 6, onAbove: 100000, offBelow: -50000, windowHours: 24, replay: true };
+const ADAPTIVE_DEFAULTS = { minEvents: 6, minMidGaps: 2, onAbove: 100000, offBelow: -50000, windowHours: 24, replay: true };
 
 function parseAdaptive(a) {
   if (!a || typeof a !== 'object' || a.enabled !== true) return null;
   const num = (k) => (Number.isFinite(a[k]) ? a[k] : ADAPTIVE_DEFAULTS[k]);
   const cfg = {
     minEvents: Math.max(1, Math.floor(num('minEvents'))),
+    minMidGaps: Math.max(0, Math.floor(num('minMidGaps'))),
     onAbove: num('onAbove'),
     offBelow: num('offBelow'),
     windowMs: Math.max(1, num('windowHours')) * 3600_000,
@@ -171,7 +176,9 @@ let replayed = false;
 
 export function _resetAdaptive() { adaptive = new Map(); replayed = false; }
 
+// Sizes are cached-prompt tokens; `prevCtx` null means the session's first request.
 export function scoreGap({ gapMs, prevCtx, ctx }) {
+  if (prevCtx == null) return -0.6 * ctx;
   if (ctx < prevCtx / 2) return -0.6 * ctx; // compaction or a new prompt: cold either way
   const fresh = Math.max(0, ctx - prevCtx);
   if (gapMs <= 5 * 60_000) return fresh ? -0.6 * fresh : 0;
@@ -179,10 +186,9 @@ export function scoreGap({ gapMs, prevCtx, ctx }) {
   return -0.6 * ctx;
 }
 
-const promptSize = (u) => {
-  const n = (x) => (Number.isFinite(x) ? x : 0);
-  return { cached: n(u?.cache_read_input_tokens) + n(u?.cache_creation_input_tokens), ctx: n(u?.input_tokens) + n(u?.cache_read_input_tokens) + n(u?.cache_creation_input_tokens) };
-};
+const n0 = (x) => (Number.isFinite(x) ? x : 0);
+const cachedSize = (u) => n0(u?.cache_read_input_tokens) + n0(u?.cache_creation_input_tokens);
+const isMid = (gapMs) => gapMs > 5 * 60_000 && gapMs <= 60 * 60_000;
 
 function prune(st, cutoff) {
   let i = 0;
@@ -190,10 +196,10 @@ function prune(st, cutoff) {
   if (i) st.events.splice(0, i);
 }
 
-function observe(cfg, session, model, usage, nowMs) {
+function observe(cfg, session, model, usage, nowMs, scoreFirst = true) {
   if (!session) return;
-  const { cached, ctx } = promptSize(usage);
-  if (!cached) return; // nothing was cached: says nothing about the cache
+  const ctx = cachedSize(usage);
+  if (!ctx) return; // nothing was cached: says nothing about the cache
   let st = adaptive.get(session);
   if (!st) {
     if (adaptive.size >= MAX_SESSIONS) {
@@ -206,8 +212,9 @@ function observe(cfg, session, model, usage, nowMs) {
   }
   const key = model || '';
   const prev = st.models.get(key);
-  if (prev && nowMs >= prev.ts) {
-    st.events.push({ ts: nowMs, net: scoreGap({ gapMs: nowMs - prev.ts, prevCtx: prev.ctx, ctx }) });
+  if ((prev && nowMs >= prev.ts) || (!prev && scoreFirst)) {
+    const gapMs = prev ? nowMs - prev.ts : null;
+    st.events.push({ ts: nowMs, mid: prev ? isMid(gapMs) : false, net: scoreGap({ gapMs, prevCtx: prev ? prev.ctx : null, ctx }) });
     if (st.events.length > MAX_EVENTS) st.events.splice(0, st.events.length - MAX_EVENTS);
   }
   if (!prev || nowMs >= prev.ts) st.models.set(key, { ts: nowMs, ctx });
@@ -226,11 +233,13 @@ function decide(cfg, session, priorOn, nowMs) {
   const st = session && adaptive.get(session);
   if (!st) return null;
   prune(st, nowMs - cfg.windowMs);
+  if (!st.events.length) st.on = null; // nothing left to go on
   if (st.on === null && st.events.length < cfg.minEvents) return null;
   if (st.events.length >= cfg.minEvents) {
     const sum = st.events.reduce((a, e) => a + e.net, 0);
+    const mids = st.events.reduce((a, e) => a + (e.mid ? 1 : 0), 0);
     const was = st.on === null ? priorOn : st.on;
-    const next = sum >= cfg.onAbove ? true : sum <= cfg.offBelow ? false : was;
+    const next = sum >= cfg.onAbove && mids >= cfg.minMidGaps ? true : sum <= cfg.offBelow ? false : was;
     if (st.on !== null && next !== st.on) console.log(`[cache-ttl] adaptive ${session} ${st.on ? 'on' : 'off'} -> ${next ? 'on' : 'off'} (window net ${Math.round(sum)} over ${st.events.length} requests)`);
     st.on = next;
   }
@@ -238,37 +247,51 @@ function decide(cfg, session, priorOn, nowMs) {
 }
 
 // Rebuild the adaptive state from the last window of the usage ledger, once.
-// Reads at most `maxBytes` from the end of the file; returns lines replayed.
-export function replayUsageLog(path, rule = loadTtlRule(), now = Date.now(), maxBytes = 48 * 1024 * 1024) {
+// Reads backwards in 1 MiB chunks only as far as the window reaches (a day is a
+// few MiB), capped at `maxBytes`; returns the number of lines replayed. A
+// session's first line in the window is not scored as a first request.
+export function replayUsageLog(path, rule = loadTtlRule(), now = Date.now(), maxBytes = 64 * 1024 * 1024) {
   const cfg = rule.adaptive;
   if (!cfg || !path) return 0;
-  let text;
+  const since = new Date(now - cfg.windowMs).toISOString();
+  const until = new Date(now).toISOString();
+  const CHUNK = 1024 * 1024;
+  let text = '';
   try {
     const fd = openSync(path, 'r');
     try {
-      const size = fstatSync(fd).size;
-      const len = Math.min(size, maxBytes);
-      const buf = Buffer.alloc(len);
-      readSync(fd, buf, 0, len, size - len);
-      text = buf.toString('utf8');
-      if (len < size) text = text.slice(text.indexOf('\n') + 1);
+      let pos = fstatSync(fd).size;
+      const floor = Math.max(0, pos - maxBytes);
+      while (pos > floor) {
+        const len = Math.min(CHUNK, pos - floor);
+        pos -= len;
+        const buf = Buffer.alloc(len);
+        readSync(fd, buf, 0, len, pos);
+        text = buf.toString('latin1') + text;
+        const nl = text.indexOf('\n');
+        // Stop once the first complete line in hand is older than the window.
+        if (pos > 0 && nl >= 0 && text.slice(nl + 8, nl + 32) < since) break;
+      }
+      if (pos > 0) text = text.slice(text.indexOf('\n') + 1);
     } finally { closeSync(fd); }
   } catch { return 0; }
-  const since = new Date(now - cfg.windowMs).toISOString();
-  const until = new Date(now).toISOString();
-  let count = 0;
+  text = Buffer.from(text, 'latin1').toString('utf8');
+  const rows = [];
   for (const line of text.split('\n')) {
     // `ts` is the first key; compare it as text before paying for a parse.
     const ts0 = line.slice(7, 31);
     if (ts0 < since || ts0 > until) continue;
     let r;
     try { r = JSON.parse(line); } catch { continue; }
-    const ts = Date.parse(r.ts);
-    if (!r.session || !Number.isFinite(ts)) continue;
-    observe(cfg, r.session, r.model, { input_tokens: r.input, cache_read_input_tokens: r.cache_read, cache_creation_input_tokens: r.cache_write }, ts);
-    count++;
+    const t = Date.parse(r.req_ts ?? r.ts);
+    if (!r.session || !Number.isFinite(t)) continue;
+    rows.push({ t, r });
   }
-  return count;
+  rows.sort((a, b) => a.t - b.t);
+  for (const { t, r } of rows) {
+    observe(cfg, r.session, r.model, { cache_read_input_tokens: r.cache_read, cache_creation_input_tokens: r.cache_write }, t, false);
+  }
+  return rows.length;
 }
 
 // The TTL to apply to this request and why: { ttl, reason }. `reason` is
@@ -291,7 +314,7 @@ export function ttlDecision(headers, rule = loadTtlRule(), now = Date.now) {
   const m = staticMatch(rule, session, parent, now);
   const own = decide(cfg, session, !!m, nowMs);
   if (own !== null) return { ttl: own ? rule.ttl : null, reason: own ? 'adaptive-on' : 'adaptive-off' };
-  const fromParent = parent ? decide(cfg, parent, !!m, nowMs) : null;
+  const fromParent = parent ? decide(cfg, parent, !!staticMatch(rule, parent, null, now), nowMs) : null;
   if (fromParent !== null) return { ttl: fromParent ? rule.ttl : null, reason: fromParent ? 'adaptive-parent-on' : 'adaptive-parent-off' };
   return { ttl: m ? rule.ttl : null, reason: m ? `prior-${m}` : 'prior-none' };
 }
@@ -361,6 +384,7 @@ export function usageLogLine({ account, bucket, model, sessionKey, usage, util7d
     bucket_util: Number.isFinite(bucketUtil) ? bucketUtil : null,
     ttl: sessionKey?.ttl ?? null,
     ttl_reason: sessionKey?.ttlReason ?? null,
+    req_ts: Number.isFinite(sessionKey?.reqStartMs) ? new Date(sessionKey.reqStartMs).toISOString() : null,
   });
 }
 

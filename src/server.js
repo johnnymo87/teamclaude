@@ -2578,10 +2578,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // upstream that rejects it), which the upgrade would otherwise write back.
   let ttlChoice = { ttl: null, reason: null };
   if (rewritesBody(account) && !cacheControlSubfieldsToStrip(account.stripRequestFields).has('ttl')) {
-    ttlChoice = ttlDecision(req.headers);
+    try { ttlChoice = ttlDecision(req.headers); } catch { /* never break a request */ }
     if (ttlChoice.ttl) sendBody = applyCacheTtl(sendBody, ttlChoice.ttl);
   }
-  ctx.sessionHeaders = { ...sessionHeaders(req.headers), ttl: ttlChoice.ttl, ttlReason: ttlChoice.reason };
+  ctx.sessionHeaders = { ...sessionHeaders(req.headers), ttl: ttlChoice.ttl, ttlReason: ttlChoice.reason, reqStartMs: Date.now() };
   // If the body changed length (sanitize, model rewrite, or field strip), update
   // Content-Length so the upstream doesn't receive a mismatched framing and
   // truncate or stall.

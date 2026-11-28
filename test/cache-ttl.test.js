@@ -78,7 +78,7 @@ test('usage ledger line and append', () => {
     util7d: 0.07, now: 0 }));
   assert.deepEqual(line, { ts: '1970-01-01T00:00:00.000Z', account: 'a', bucket: 'unified7d', model: 'claude-opus-5-5', session: 's', parent: null,
     input: 3, cache_read: 10, cache_write: 7, cache_write_5m: 2, cache_write_1h: 5, output: 4, util7d: 0.07,
-    util7d_source: 'cached', util5h: null, bucket_util: null, ttl: null, ttl_reason: null });
+    util7d_source: 'cached', util5h: null, bucket_util: null, ttl: null, ttl_reason: null, req_ts: null });
   const fromResp = JSON.parse(usageLogLine({ sessionKey: { session: 's', util7d: 0.12, util5h: 0.3 }, usage: {}, util7d: 0.07, bucketUtil: 0.5 }));
   assert.equal(fromResp.util7d, 0.12); assert.equal(fromResp.util7d_source, 'response');
   assert.equal(fromResp.util5h, 0.3); assert.equal(fromResp.bucket_util, 0.5);

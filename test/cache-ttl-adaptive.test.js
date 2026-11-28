@@ -33,6 +33,7 @@ function feed(rule, session, gapsMin, { ctx = 100000, parent = null, model = 'm'
 beforeEach(() => _resetAdaptive());
 
 test('scoreGap follows the loss rule: 5-60 min gaps gain, others pay the 1h premium', () => {
+  assert.equal(scoreGap({ gapMs: null, prevCtx: null, ctx: 50000 }), -30000, 'a first request is a full write');
   assert.equal(scoreGap({ gapMs: 2 * MIN, prevCtx: 100000, ctx: 101000 }), -600);
   assert.equal(scoreGap({ gapMs: 30 * MIN, prevCtx: 100000, ctx: 101000 }), 100000 - 600);
   assert.equal(scoreGap({ gapMs: 90 * MIN, prevCtx: 100000, ctx: 101000 }), -0.6 * 101000);
@@ -56,7 +57,7 @@ test('an unlisted session whose gaps sit in 5-60 min is switched on', () => {
 
 test('before minEvents the static rule is the prior', () => {
   const rule = ruleFile({ sessions: ['ses_a'] });
-  const t = feed(rule, 'ses_a', [90, 90]);
+  const t = feed(rule, 'ses_a', [90]);
   assert.deepEqual(ttlDecision({ 'x-session-id': 'ses_a' }, rule, () => t), { ttl: '1h', reason: 'prior-list' });
   assert.deepEqual(ttlDecision({ 'x-session-id': 'ses_z' }, rule, () => t), { ttl: null, reason: 'prior-none' });
 });
@@ -71,10 +72,10 @@ test('hysteresis: a score between the thresholds keeps the current state', () =>
   const rule = ruleFile();
   let t = feed(rule, 'ses_b', [30, 30, 30], { ctx: 100000 });
   assert.equal(ttlForRequest({ 'x-session-id': 'ses_b' }, rule, () => t), '1h');
-  // Four losses bring the window score to +0.06M: inside the band, stays on.
+  // First write -0.06M, three gains +0.3M, four losses -0.24M: 0, inside the band, stays on.
   for (let i = 0; i < 4; i++) { t += 120 * MIN; observeUsage({ session: 'ses_b', model: 'm', usage: usage(100000), now: t }, rule); }
   assert.deepEqual(ttlDecision({ 'x-session-id': 'ses_b' }, rule, () => t), { ttl: '1h', reason: 'adaptive-on' });
-  // Two more push it under offBelow (-0.06M): off, and it stays off inside the band.
+  // Two more push it under offBelow (-0.12M): off, and it stays off inside the band.
   for (let i = 0; i < 2; i++) { t += 120 * MIN; observeUsage({ session: 'ses_b', model: 'm', usage: usage(100000), now: t }, rule); }
   assert.equal(ttlForRequest({ 'x-session-id': 'ses_b' }, rule, () => t), null);
   t += 30 * MIN; observeUsage({ session: 'ses_b', model: 'm', usage: usage(100000), now: t }, rule);
@@ -126,4 +127,36 @@ test('the ledger line records the TTL decision', () => {
   assert.equal(j.ttl, '1h'); assert.equal(j.ttl_reason, 'adaptive-on');
   const k = JSON.parse(usageLogLine({ sessionKey: { session: 's' }, usage: {} }));
   assert.equal(k.ttl, null); assert.equal(k.ttl_reason, null);
+});
+
+test('one big 5-60 min gap is not enough to switch on (minMidGaps)', () => {
+  const rule = ruleFile();
+  const t = feed(rule, 'ses_b', [30, 1, 1, 1, 1], { ctx: 500000 });
+  // -0.3M first write, +0.5M once, then four warm repeats: +0.2M, above onAbove, but only one mid gap.
+  assert.deepEqual(ttlDecision({ 'x-session-id': 'ses_b' }, rule, () => t), { ttl: null, reason: 'adaptive-off' });
+});
+
+test('a session whose window empties forgets its state and returns to the prior', () => {
+  const rule = ruleFile();
+  const t = feed(rule, 'ses_b', [30, 30, 30]);
+  assert.equal(ttlForRequest({ 'x-session-id': 'ses_b' }, rule, () => t), '1h');
+  const later = t + 25 * 60 * MIN;
+  assert.deepEqual(ttlDecision({ 'x-session-id': 'ses_b' }, rule, () => later), { ttl: null, reason: 'prior-none' });
+});
+
+test("a parent's undecided state starts from the parent's own prior, not the child's", () => {
+  const rule = ruleFile({ sessions: ['ses_c'] });
+  const t = feed(rule, 'ses_p', [30, 30], { ctx: 50000 }); // -30k + 50k + 50k = +70k: inside the band
+  assert.deepEqual(ttlDecision({ 'x-session-id': 'ses_c', 'x-parent-session-id': 'ses_p' }, rule, () => t),
+    { ttl: null, reason: 'adaptive-parent-off' });
+});
+
+test('replay prefers req_ts and does not score a replayed first line', () => {
+  const rule = ruleFile({ adaptive: { enabled: true, minEvents: 1, onAbove: 1, offBelow: -1, minMidGaps: 0, windowHours: 24, replay: false } });
+  const log = join(dir, 'usage2.jsonl');
+  const line = (ts, req) => usageLogLine({ model: 'm', sessionKey: { session: 'ses_q', reqStartMs: req }, usage: usage(100000), now: ts });
+  // Settle times 4 min apart, but the requests started 10 min apart: a 5-60 min gap.
+  writeFileSync(log, line(T0 + 2 * MIN, T0) + '\n' + line(T0 + 6 * MIN, T0 + 10 * MIN) + '\n');
+  assert.equal(replayUsageLog(log, rule, T0 + 20 * MIN), 2);
+  assert.deepEqual(ttlDecision({ 'x-session-id': 'ses_q' }, rule, () => T0 + 20 * MIN), { ttl: '1h', reason: 'adaptive-on' });
 });
