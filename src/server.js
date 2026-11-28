@@ -6,7 +6,7 @@ import { readdir, stat, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ensureCerts, createConnectHandler, mitmHosts } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
-import { ttlForRequest, applyCacheTtl, sessionHeaders } from './cache-ttl.js';
+import { ttlDecision, applyCacheTtl, sessionHeaders } from './cache-ttl.js';
 import { sanitizeToolPairs } from './tool-pair-sanitize.js';
 import { sanitizeCacheControl, cacheControlSubfieldsToStrip } from './cache-control-sanitize.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
@@ -2576,11 +2576,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // Opt-in per-session cache TTL upgrade (src/cache-ttl.js); Anthropic bodies only.
   // Skipped for an account configured to strip cache_control.ttl (a strict
   // upstream that rejects it), which the upgrade would otherwise write back.
+  let ttlChoice = { ttl: null, reason: null };
   if (rewritesBody(account) && !cacheControlSubfieldsToStrip(account.stripRequestFields).has('ttl')) {
-    const ttl = ttlForRequest(req.headers);
-    if (ttl) sendBody = applyCacheTtl(sendBody, ttl);
+    try { ttlChoice = ttlDecision(req.headers); } catch { /* never break a request */ }
+    if (ttlChoice.ttl) sendBody = applyCacheTtl(sendBody, ttlChoice.ttl);
   }
-  ctx.sessionHeaders = sessionHeaders(req.headers);
+  ctx.sessionHeaders = { ...sessionHeaders(req.headers), ttl: ttlChoice.ttl, ttlReason: ttlChoice.reason };
   // If the body changed length (sanitize, model rewrite, or field strip), update
   // Content-Length so the upstream doesn't receive a mismatched framing and
   // truncate or stall.
@@ -2632,6 +2633,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     }
     let upstreamRes;
     let admittedLoad = 0;
+    // The adaptive cache-TTL rule times gaps from here: after any admission wait.
+    if (ctx.sessionHeaders) ctx.sessionHeaders.reqStartMs = Date.now();
     try {
       upstreamRes = await upstreamFetch(upstreamUrl, {
         method,

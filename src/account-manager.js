@@ -1,4 +1,4 @@
-import { appendUsageLog } from './cache-ttl.js';
+import { appendUsageLog, observeUsage } from './cache-ttl.js';
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired, formatMoney } from './oauth.js';
 import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount, canServeProvider } from './provider.js';
 import { refreshCodexToken } from './codex-auth.js';
@@ -4321,6 +4321,12 @@ export class AccountManager {
    */
   recordTokenUsage(accountIndex, sessionId, model, usage, sessionKey = null) {
     if (!usage) return;
+    // Opt-in adaptive cache-TTL rule learns from every settled response.
+    // Only responses a TTL decision was made for (Anthropic bodies), timed from
+    // the request's start.
+    if (sessionKey?.session && sessionKey.ttlReason != null) {
+      observeUsage({ session: sessionKey.session, model, usage, now: Number.isFinite(sessionKey.reqStartMs) ? sessionKey.reqStartMs : Date.now() });
+    }
     // Opt-in per-response ledger (TEAMCLAUDE_USAGE_LOG; src/cache-ttl.js).
     if (process.env.TEAMCLAUDE_USAGE_LOG) {
       const acct = this.accounts[accountIndex];
